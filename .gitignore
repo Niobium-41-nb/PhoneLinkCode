@@ -1,0 +1,14 @@
+# Build outputs
+*.exe
+*.obj
+*.res
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# Runtime data (credentials live in %LOCALAPPDATA%\PhoneLinkCode)
+mail.ini
+app.log
+state.txt
+*.eml
