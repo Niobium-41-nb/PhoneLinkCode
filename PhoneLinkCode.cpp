@@ -650,6 +650,10 @@ static bool CopyToClipboard(const wstring& text) {
 static NOTIFYICONDATAW g_nid = {};
 static bool g_trayAdded = false;
 static HWND g_hwnd = nullptr;
+static UINT g_showMailMsg = 0;   // 向已运行实例请求打开邮箱管理窗口
+
+static const wchar_t* kHiddenClass = L"PhoneLinkCodeHiddenWindow";
+static const wchar_t* kShowMailMsgName = L"PhoneLinkCode.ShowMailManager";
 
 static void Balloon(const wstring& title, const wstring& text) {
     if (!g_trayAdded) return;
@@ -824,6 +828,642 @@ static void OpenLog() {
     if (FileExists(g_logPath)) ShellExecuteW(nullptr, L"open", g_logPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+// ---------------------------------------------------------------------------
+// 邮箱管理窗口（原生 Win32 界面）
+// ---------------------------------------------------------------------------
+
+static const UINT kMailTestDoneMsg = WM_APP + 20;
+
+enum {
+    kMailCtlHint = 100,
+    kMailCtlList,
+    kMailCtlAdd,
+    kMailCtlEdit,
+    kMailCtlRemove,
+    kMailCtlToggle,
+    kMailCtlStatus,
+    kMailCtlClose,
+};
+
+enum {
+    kMailEditCtlEmail = 200,
+    kMailEditCtlHost,
+    kMailEditCtlPort,
+    kMailEditCtlSecret,
+    kMailEditCtlEnable,
+    kMailEditCtlNotice,
+    kMailEditCtlStatus,
+    kMailEditCtlSave,
+    kMailEditCtlCancel,
+};
+
+static HWND g_mailMgr = nullptr;
+static HWND g_mailList = nullptr;
+static HWND g_mailHint = nullptr;
+static HWND g_mailStatus = nullptr;
+static HWND g_mailBtnAdd = nullptr;
+static HWND g_mailBtnEdit = nullptr;
+static HWND g_mailBtnRemove = nullptr;
+static HWND g_mailBtnToggle = nullptr;
+static vector<MailAccountInfo> g_mailRows;
+static HFONT g_uiFont = nullptr;
+static bool g_mailEditSaved = false;
+static bool g_mailUiAtStart = false;
+
+typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+
+static UINT WindowDpi(HWND hwnd) {
+    static GetDpiForWindowFn fn = []() -> GetDpiForWindowFn {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        return user32 ? (GetDpiForWindowFn)(void*)GetProcAddress(user32, "GetDpiForWindow") : nullptr;
+    }();
+    UINT dpi = (fn && hwnd) ? fn(hwnd) : 0;
+    return dpi ? dpi : 96;
+}
+
+static int DpiScale(HWND hwnd, int v) {
+    return MulDiv(v, (int)WindowDpi(hwnd), 96);
+}
+
+static HFONT UiFont() {
+    if (g_uiFont) return g_uiFont;
+    NONCLIENTMETRICSW ncm = { sizeof(ncm) };
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+        g_uiFont = CreateFontIndirectW(&ncm.lfMessageFont);
+    if (!g_uiFont) g_uiFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    return g_uiFont;
+}
+
+static HWND MakeCtl(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style,
+                    int id, HFONT font) {
+    HWND h = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0,
+                             parent, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
+    if (h && font) SendMessageW(h, WM_SETFONT, (WPARAM)font, TRUE);
+    return h;
+}
+
+static wstring EditText(HWND h) {
+    int n = GetWindowTextLengthW(h);
+    wstring s((size_t)n + 1, L'\0');
+    if (n > 0) GetWindowTextW(h, s.data(), n + 1);
+    s.resize((size_t)n);
+    return s;
+}
+
+static void MailMgrUpdateButtons();
+
+static void LayoutMailMgr(HWND hwnd) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int m = DpiScale(hwnd, 16), gap = DpiScale(hwnd, 10);
+    int lineH = DpiScale(hwnd, 22), btnW = DpiScale(hwnd, 150), btnH = DpiScale(hwnd, 32);
+    int closeH = DpiScale(hwnd, 30), statusH = DpiScale(hwnd, 48);
+    int w = rc.right, h = rc.bottom;
+    int rightX = w - m - btnW;
+    int listTop = m + lineH + gap;
+    int listBottom = h - m - closeH - gap - statusH;
+    int listW = rightX - gap - m;
+    if (listW < DpiScale(hwnd, 200)) listW = DpiScale(hwnd, 200);
+    if (listBottom < listTop + btnH * 2) listBottom = listTop + btnH * 2;
+
+    MoveWindow(g_mailHint, m, m, w - 2 * m, lineH, TRUE);
+    MoveWindow(g_mailList, m, listTop, listW, listBottom - listTop, TRUE);
+    MoveWindow(g_mailBtnAdd, rightX, listTop, btnW, btnH, TRUE);
+    MoveWindow(g_mailBtnEdit, rightX, listTop + (btnH + gap), btnW, btnH, TRUE);
+    MoveWindow(g_mailBtnRemove, rightX, listTop + 2 * (btnH + gap), btnW, btnH, TRUE);
+    MoveWindow(g_mailBtnToggle, rightX, listTop + 3 * (btnH + gap), btnW, btnH, TRUE);
+    MoveWindow(g_mailStatus, m, listBottom + gap, w - 2 * m, statusH, TRUE);
+    HWND close = GetDlgItem(hwnd, kMailCtlClose);
+    if (close) MoveWindow(close, w - m - DpiScale(hwnd, 96), h - m - closeH, DpiScale(hwnd, 96), closeH, TRUE);
+}
+
+static void MailMgrUpdateButtons() {
+    if (!g_mailList) return;
+    int sel = (int)SendMessageW(g_mailList, LB_GETCURSEL, 0, 0);
+    bool has = sel >= 0 && sel < (int)g_mailRows.size();
+    EnableWindow(g_mailBtnEdit, has);
+    EnableWindow(g_mailBtnRemove, has);
+    EnableWindow(g_mailBtnToggle, has);
+    SetWindowTextW(g_mailBtnToggle, has && g_mailRows[(size_t)sel].enabled ? L"停用" : L"启用");
+}
+
+static void MailMgrRefresh() {
+    if (!g_mailList) return;
+    int sel = (int)SendMessageW(g_mailList, LB_GETCURSEL, 0, 0);
+    g_mailRows = MailGetAccounts();
+    SendMessageW(g_mailList, LB_RESETCONTENT, 0, 0);
+    for (const auto& a : g_mailRows) {
+        wstring line = a.enabled ? L"[启用]   " : L"[已停用] ";
+        line += a.email.empty() ? wstring(L"（地址为空）") : a.email;
+        line += L"    " + a.host + L":" + std::to_wstring(a.port);
+        if (!a.hasSecret) line += L"    （缺少授权码）";
+        SendMessageW(g_mailList, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+    }
+    int n = (int)g_mailRows.size();
+    if (sel >= n) sel = n - 1;
+    if (sel < 0 && n > 0) sel = 0;
+    SendMessageW(g_mailList, LB_SETCURSEL, (WPARAM)(sel < 0 ? -1 : sel), 0);
+    MailMgrUpdateButtons();
+}
+
+static void MailMgrApply(const wstring& what) {
+    SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    MailReloadWorkers(g_hwnd);
+    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    int n = MailEnabledCount();
+    wstring s = what + L"\n" +
+                (n > 0 ? L"已在后台监控 " + std::to_wstring(n) + L" 个邮箱。"
+                       : wstring(L"当前没有启用的邮箱，邮箱监控已停止。"));
+    if (g_mailStatus) SetWindowTextW(g_mailStatus, s.c_str());
+    MailMgrRefresh();
+}
+
+static bool MailMgrSelected(MailAccountInfo& out) {
+    if (!g_mailList) return false;
+    int sel = (int)SendMessageW(g_mailList, LB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= (int)g_mailRows.size()) return false;
+    out = g_mailRows[(size_t)sel];
+    return true;
+}
+
+struct MailEditInit {
+    bool isNew = true;
+    wstring oldEmail;
+    wstring email;
+    wstring host;
+    int port = 993;
+    bool enabled = true;
+    bool hasSecret = false;
+};
+
+struct MailEditState {
+    MailEditInit init;
+    HWND email = nullptr;
+    HWND host = nullptr;
+    HWND port = nullptr;
+    HWND secret = nullptr;
+    HWND enableChk = nullptr;
+    HWND status = nullptr;
+    HWND saveBtn = nullptr;
+    HWND cancelBtn = nullptr;
+    bool testing = false;
+};
+
+struct MailTestJob {
+    HWND dlg = nullptr;
+    wstring ownerEmail;
+    wstring email;
+    wstring host;
+    int port = 993;
+    wstring secret;
+    bool enabled = true;
+};
+
+struct MailTestResult {
+    bool ok = false;
+    wstring message;
+    wstring ownerEmail;
+    wstring email;
+    wstring host;
+    int port = 993;
+    wstring secret;
+    bool enabled = true;
+    long long uidValidity = 0;
+    long long uidNext = 0;
+};
+
+static DWORD WINAPI MailTestThread(LPVOID param) {
+    MailTestJob* job = static_cast<MailTestJob*>(param);
+    MailTestResult* res = new MailTestResult;
+    res->ownerEmail = job->ownerEmail;
+    res->email = job->email;
+    res->host = job->host;
+    res->port = job->port;
+    res->secret = job->secret;
+    res->enabled = job->enabled;
+    res->ok = MailTestAccount(job->ownerEmail, job->email, job->host, job->port, job->secret,
+                              res->message, res->uidValidity, res->uidNext);
+    if (!PostMessageW(job->dlg, kMailTestDoneMsg, 0, (LPARAM)res)) delete res;
+    delete job;
+    return 0;
+}
+
+static MailEditState* MailEditOf(HWND hwnd) {
+    return reinterpret_cast<MailEditState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+}
+
+static void MailEditLayout(HWND hwnd, MailEditState* st) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int m = DpiScale(hwnd, 16), row = DpiScale(hwnd, 38), rowH = DpiScale(hwnd, 26);
+    int labelW = DpiScale(hwnd, 100), x = m + labelW + DpiScale(hwnd, 12);
+    int w = rc.right, fullW = w - m - x;
+    int y = DpiScale(hwnd, 16);
+
+    MoveWindow(st->email, x, y, fullW, rowH, TRUE);
+    y += row;
+    MoveWindow(st->host, x, y, DpiScale(hwnd, 290), rowH, TRUE);
+    HWND portLabel = GetDlgItem(hwnd, kMailEditCtlPort + 1000);
+    if (portLabel) MoveWindow(portLabel, x + DpiScale(hwnd, 300), y + DpiScale(hwnd, 4), DpiScale(hwnd, 44), rowH, TRUE);
+    MoveWindow(st->port, x + DpiScale(hwnd, 348), y, DpiScale(hwnd, 100), rowH, TRUE);
+    y += row;
+    MoveWindow(st->secret, x, y, fullW, rowH, TRUE);
+    y += rowH + DpiScale(hwnd, 6);
+    HWND notice = GetDlgItem(hwnd, kMailEditCtlNotice);
+    if (notice) MoveWindow(notice, x, y, fullW, DpiScale(hwnd, 20), TRUE);
+    y += DpiScale(hwnd, 30);
+    MoveWindow(st->enableChk, x, y, fullW, rowH, TRUE);
+    y += rowH + DpiScale(hwnd, 12);
+    int statusH = DpiScale(hwnd, 60);
+    MoveWindow(st->status, m, y, w - 2 * m, statusH, TRUE);
+    int btnY = rc.bottom - m - DpiScale(hwnd, 32);
+    MoveWindow(st->saveBtn, w - m - DpiScale(hwnd, 258), btnY, DpiScale(hwnd, 130), DpiScale(hwnd, 32), TRUE);
+    MoveWindow(st->cancelBtn, w - m - DpiScale(hwnd, 118), btnY, DpiScale(hwnd, 118), DpiScale(hwnd, 32), TRUE);
+}
+
+static void MailEditStartSave(HWND hwnd) {
+    MailEditState* st = MailEditOf(hwnd);
+    if (!st || st->testing) return;
+
+    wstring email = EditText(st->email);
+    Trim(email);
+    if (email.empty() || email.find(L'@') == wstring::npos) {
+        SetWindowTextW(st->status, L"请填写完整的邮箱地址，例如 someone@qq.com。");
+        SetFocus(st->email);
+        return;
+    }
+    wstring host = EditText(st->host);
+    Trim(host);
+    if (host.empty()) host = MailGuessHost(email);
+    if (host.find(L':') != wstring::npos || host.find(L' ') != wstring::npos) {
+        SetWindowTextW(st->status, L"服务器只填写主机名（如 imap.qq.com），端口请填在右侧。");
+        SetFocus(st->host);
+        return;
+    }
+    SetWindowTextW(st->host, host.c_str());
+
+    wstring portStr = EditText(st->port);
+    Trim(portStr);
+    int port = portStr.empty() ? 993 : _wtoi(portStr.c_str());
+    if (port <= 0 || port > 65535) {
+        SetWindowTextW(st->status, L"端口需要是 1-65535 之间的数字，通常是 993。");
+        SetFocus(st->port);
+        return;
+    }
+
+    wstring secret = EditText(st->secret);
+    Trim(secret);
+    if (secret.empty() && (st->init.isNew || !st->init.hasSecret)) {
+        SetWindowTextW(st->status, L"请填写邮箱生成的授权码/应用专用密码。");
+        SetFocus(st->secret);
+        return;
+    }
+
+    st->testing = true;
+    EnableWindow(st->saveBtn, FALSE);
+    EnableWindow(st->cancelBtn, FALSE);
+    SetWindowTextW(st->status, (L"正在连接 " + host + L":" + std::to_wstring(port) +
+                                L" 并验证登录，请稍候...").c_str());
+
+    MailTestJob* job = new MailTestJob;
+    job->dlg = hwnd;
+    job->ownerEmail = st->init.isNew ? wstring() : st->init.oldEmail;
+    job->email = email;
+    job->host = host;
+    job->port = port;
+    job->secret = secret;
+    job->enabled = IsDlgButtonChecked(hwnd, kMailEditCtlEnable) == BST_CHECKED;
+    HANDLE th = CreateThread(nullptr, 0, MailTestThread, job, 0, nullptr);
+    if (th) {
+        CloseHandle(th);
+    } else {
+        delete job;
+        st->testing = false;
+        EnableWindow(st->saveBtn, TRUE);
+        EnableWindow(st->cancelBtn, TRUE);
+        SetWindowTextW(st->status, L"无法创建验证线程。");
+    }
+}
+
+static LRESULT CALLBACK MailEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    MailEditState* st = MailEditOf(hwnd);
+    switch (msg) {
+    case WM_CREATE: {
+        st = reinterpret_cast<MailEditState*>(((CREATESTRUCTW*)lParam)->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)st);
+        HFONT f = UiFont();
+        int m = DpiScale(hwnd, 16);
+        int labelX = m, labelW = DpiScale(hwnd, 100);
+
+        MakeCtl(hwnd, L"STATIC", L"邮箱地址:", SS_RIGHT | SS_NOPREFIX, kMailEditCtlEmail + 1000, f);
+        st->email = MakeCtl(hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kMailEditCtlEmail, f);
+        MakeCtl(hwnd, L"STATIC", L"IMAP 服务器:", SS_RIGHT | SS_NOPREFIX, kMailEditCtlHost + 1000, f);
+        st->host = MakeCtl(hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kMailEditCtlHost, f);
+        MakeCtl(hwnd, L"STATIC", L"端口:", SS_RIGHT | SS_NOPREFIX, kMailEditCtlPort + 1000, f);
+        st->port = MakeCtl(hwnd, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP, kMailEditCtlPort, f);
+        MakeCtl(hwnd, L"STATIC", L"授权码/密码:", SS_RIGHT | SS_NOPREFIX, kMailEditCtlSecret + 1000, f);
+        st->secret = MakeCtl(hwnd, L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP, kMailEditCtlSecret, f);
+        st->enableChk = MakeCtl(hwnd, L"BUTTON", L"启用此邮箱（后台自动检查新邮件）", BS_AUTOCHECKBOX | WS_TABSTOP, kMailEditCtlEnable, f);
+        const wchar_t* noticeText = st->init.isNew
+            ? L"请填写邮箱生成的授权码/应用专用密码，不是网页登录密码。"
+            : L"授权码留空表示沿用已保存的授权码。";
+        MakeCtl(hwnd, L"STATIC", noticeText, SS_LEFT | SS_NOPREFIX, kMailEditCtlNotice, f);
+        st->status = MakeCtl(hwnd, L"STATIC", L"点击“测试并保存”会先连接邮箱验证授权码，验证通过后才写入配置。",
+                             SS_LEFT | SS_NOPREFIX, kMailEditCtlStatus, f);
+        st->saveBtn = MakeCtl(hwnd, L"BUTTON", L"测试并保存", BS_DEFPUSHBUTTON | WS_TABSTOP, kMailEditCtlSave, f);
+        st->cancelBtn = MakeCtl(hwnd, L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP, kMailEditCtlCancel, f);
+
+        SetWindowTextW(st->email, st->init.email.c_str());
+        SetWindowTextW(st->host, st->init.host.c_str());
+        SetWindowTextW(st->port, std::to_wstring(st->init.port).c_str());
+        SendMessageW(st->enableChk, BM_SETCHECK, st->init.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // 标签与输入框按行对齐（端口标签在 MailEditLayout 中定位）
+        int row = DpiScale(hwnd, 38), y = DpiScale(hwnd, 16);
+        HWND labelEmail = GetDlgItem(hwnd, kMailEditCtlEmail + 1000);
+        HWND labelHost = GetDlgItem(hwnd, kMailEditCtlHost + 1000);
+        HWND labelSecret = GetDlgItem(hwnd, kMailEditCtlSecret + 1000);
+        MoveWindow(labelEmail, labelX, y + DpiScale(hwnd, 4), labelW, DpiScale(hwnd, 22), TRUE);
+        MoveWindow(labelHost, labelX, y + row + DpiScale(hwnd, 4), labelW, DpiScale(hwnd, 22), TRUE);
+        MoveWindow(labelSecret, labelX, y + 2 * row + DpiScale(hwnd, 4), labelW, DpiScale(hwnd, 22), TRUE);
+        MailEditLayout(hwnd, st);
+
+        SetFocus(st->email);
+        SendMessageW(st->email, EM_SETSEL, 0, (LPARAM)-1);
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        int code = HIWORD(wParam);
+        if (!st) return 0;
+        if (id == kMailEditCtlSave) {
+            MailEditStartSave(hwnd);
+            return 0;
+        }
+        if (id == kMailEditCtlCancel) {
+            if (!st->testing) DestroyWindow(hwnd);
+            return 0;
+        }
+        if (id == kMailEditCtlEmail && code == EN_KILLFOCUS) {
+            wstring host = EditText(st->host);
+            Trim(host);
+            wstring email = EditText(st->email);
+            Trim(email);
+            if (host.empty() && email.find(L'@') != wstring::npos)
+                SetWindowTextW(st->host, MailGuessHost(email).c_str());
+            return 0;
+        }
+        return 0;
+    }
+    case kMailTestDoneMsg: {
+        MailTestResult* res = reinterpret_cast<MailTestResult*>(lParam);
+        if (!res) return 0;
+        if (!st) { delete res; return 0; }
+        st->testing = false;
+        EnableWindow(st->saveBtn, TRUE);
+        EnableWindow(st->cancelBtn, TRUE);
+        if (!res->ok) {
+            SetWindowTextW(st->status, res->message.c_str());
+            delete res;
+            return 0;
+        }
+        wstring saveMsg;
+        bool saved = MailSaveAccount(res->ownerEmail, res->email, res->host, res->port, res->secret,
+                                     res->enabled, res->uidValidity, res->uidNext, saveMsg);
+        delete res;
+        if (!saved) {
+            SetWindowTextW(st->status, saveMsg.c_str());
+            return 0;
+        }
+        g_mailEditSaved = true;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wParam;
+        SetBkMode(dc, TRANSPARENT);
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+    }
+    case WM_CLOSE:
+        if (st && st->testing) return 0;
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_NCDESTROY:
+        if (st) delete st;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void RunMailEditModal(HWND owner, HWND dlg) {
+    EnableWindow(owner, FALSE);
+    MSG msg;
+    while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        bool inDlg = msg.hwnd == dlg || IsChild(dlg, msg.hwnd);
+        if (inDlg && msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            SendMessageW(dlg, WM_COMMAND, MAKEWPARAM(kMailEditCtlCancel, BN_CLICKED), 0);
+            continue;
+        }
+        if (inDlg && msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
+            SendMessageW(dlg, WM_COMMAND, MAKEWPARAM(kMailEditCtlSave, BN_CLICKED), 0);
+            continue;
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    if (IsWindow(owner)) {
+        EnableWindow(owner, TRUE);
+        SetActiveWindow(owner);
+    }
+}
+
+static void MailMgrEdit(const MailAccountInfo* acc) {
+    if (!g_mailMgr) return;
+    static bool registered = false;
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = MailEditProc;
+        wc.hInstance = inst;
+        wc.lpszClassName = L"PhoneLinkCodeMailEditWindow";
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    MailEditState* st = new MailEditState;
+    if (acc) {
+        st->init.isNew = false;
+        st->init.oldEmail = acc->email;
+        st->init.email = acc->email;
+        st->init.host = acc->host;
+        st->init.port = acc->port;
+        st->init.enabled = acc->enabled;
+        st->init.hasSecret = acc->hasSecret;
+    }
+
+    RECT ownerRc, work;
+    GetWindowRect(g_mailMgr, &ownerRc);
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int w = DpiScale(g_mailMgr, 600), h = DpiScale(g_mailMgr, 362);
+    int x = ownerRc.left + ((ownerRc.right - ownerRc.left) - w) / 2;
+    int y = ownerRc.top + ((ownerRc.bottom - ownerRc.top) - h) / 3;
+    if (x < work.left) x = work.left;
+    if (y < work.top) y = work.top;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"PhoneLinkCodeMailEditWindow",
+                               acc ? L"编辑邮箱" : L"添加邮箱",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
+                               x, y, w, h, g_mailMgr, nullptr, inst, st);
+    if (!dlg) {
+        delete st;
+        return;
+    }
+    ShowWindow(dlg, SW_SHOWNORMAL);
+    RunMailEditModal(g_mailMgr, dlg);
+    if (g_mailEditSaved) {
+        g_mailEditSaved = false;
+        MailMgrApply(L"邮箱设置已保存。");
+    }
+}
+
+static void MailMgrEditSelected() {
+    MailAccountInfo a;
+    if (MailMgrSelected(a)) MailMgrEdit(&a);
+}
+
+static void MailMgrRemoveSelected() {
+    MailAccountInfo a;
+    if (!MailMgrSelected(a)) return;
+    wstring q = L"确定要删除邮箱 " + a.email + L" 吗？\n\n该账号的授权码和监听进度会一并删除，无法恢复。";
+    if (MessageBoxW(g_mailMgr, q.c_str(), L"删除邮箱", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES)
+        return;
+    wstring msg;
+    MailRemoveAccount(a.email, msg);
+    MailMgrApply(msg);
+}
+
+static void MailMgrToggleSelected() {
+    MailAccountInfo a;
+    if (!MailMgrSelected(a)) return;
+    wstring msg;
+    MailSetEnabled(a.email, !a.enabled, msg);
+    MailMgrApply(msg);
+}
+
+static LRESULT CALLBACK MailMgrProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        HFONT f = UiFont();
+        g_mailHint = MakeCtl(hwnd, L"STATIC",
+                             L"以下邮箱的新邮件会自动提取验证码并复制到剪贴板（IMAP 只读，不会把邮件标记为已读）。",
+                             SS_LEFT | SS_NOPREFIX, kMailCtlHint, f);
+        g_mailList = MakeCtl(hwnd, L"LISTBOX", L"",
+                             WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_TABSTOP,
+                             kMailCtlList, f);
+        g_mailBtnAdd = MakeCtl(hwnd, L"BUTTON", L"添加邮箱...", BS_PUSHBUTTON | WS_TABSTOP, kMailCtlAdd, f);
+        g_mailBtnEdit = MakeCtl(hwnd, L"BUTTON", L"编辑...", BS_PUSHBUTTON | WS_TABSTOP, kMailCtlEdit, f);
+        g_mailBtnRemove = MakeCtl(hwnd, L"BUTTON", L"删除", BS_PUSHBUTTON | WS_TABSTOP, kMailCtlRemove, f);
+        g_mailBtnToggle = MakeCtl(hwnd, L"BUTTON", L"启用", BS_PUSHBUTTON | WS_TABSTOP, kMailCtlToggle, f);
+        g_mailStatus = MakeCtl(hwnd, L"STATIC",
+                               L"QQ/163/Gmail 等请使用邮箱生成的授权码，而不是网页登录密码。修改后立即生效，无需重启程序。",
+                               SS_LEFT | SS_NOPREFIX, kMailCtlStatus, f);
+        MakeCtl(hwnd, L"BUTTON", L"关闭", BS_PUSHBUTTON | WS_TABSTOP, kMailCtlClose, f);
+        MailMgrRefresh();
+        LayoutMailMgr(hwnd);
+        return 0;
+    }
+    case WM_SIZE:
+        LayoutMailMgr(hwnd);
+        return 0;
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO* mm = (MINMAXINFO*)lParam;
+        mm->ptMinTrackSize.x = DpiScale(hwnd, 560);
+        mm->ptMinTrackSize.y = DpiScale(hwnd, 380);
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        int code = HIWORD(wParam);
+        if (id == kMailCtlList && code == LBN_SELCHANGE) {
+            MailMgrUpdateButtons();
+            return 0;
+        }
+        if (id == kMailCtlList && code == LBN_DBLCLK) {
+            MailMgrEditSelected();
+            return 0;
+        }
+        switch (id) {
+        case kMailCtlAdd: MailMgrEdit(nullptr); break;
+        case kMailCtlEdit: MailMgrEditSelected(); break;
+        case kMailCtlRemove: MailMgrRemoveSelected(); break;
+        case kMailCtlToggle: MailMgrToggleSelected(); break;
+        case kMailCtlClose: DestroyWindow(hwnd); break;
+        }
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wParam;
+        SetBkMode(dc, TRANSPARENT);
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+    }
+    case WM_DESTROY:
+        g_mailMgr = nullptr;
+        g_mailList = nullptr;
+        g_mailHint = nullptr;
+        g_mailStatus = nullptr;
+        g_mailBtnEdit = nullptr;
+        g_mailBtnRemove = nullptr;
+        g_mailBtnToggle = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowMailManager() {
+    if (g_mailMgr && IsWindow(g_mailMgr)) {
+        ShowWindow(g_mailMgr, SW_RESTORE);
+        SetForegroundWindow(g_mailMgr);
+        return;
+    }
+    static bool registered = false;
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    if (!registered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = MailMgrProc;
+        wc.hInstance = inst;
+        wc.lpszClassName = L"PhoneLinkCodeMailMgrWindow";
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+        wc.hIconSm = wc.hIcon;
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    RECT work;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int w = DpiScale(g_hwnd, 660), h = DpiScale(g_hwnd, 440);
+    int x = work.left + ((work.right - work.left) - w) / 2;
+    int y = work.top + ((work.bottom - work.top) - h) / 3;
+    g_mailMgr = CreateWindowExW(0, L"PhoneLinkCodeMailMgrWindow", L"邮箱验证码管理",
+                                WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
+                                x, y, w, h, g_hwnd, nullptr, inst, nullptr);
+    if (!g_mailMgr) {
+        Log(L"打开邮箱管理窗口失败，错误码 " + std::to_wstring(GetLastError()));
+        return;
+    }
+    Log(L"已打开邮箱管理窗口");
+    ShowWindow(g_mailMgr, SW_SHOWNORMAL);
+    SetForegroundWindow(g_mailMgr);
+}
+
 static void ShowTrayMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, 1, L"立即扫描");
@@ -849,24 +1489,17 @@ static void ShowTrayMenu() {
         bool enable = !IsAutostartEnabled();
         if (SetAutostart(enable)) Log(enable ? L"已开启开机自启" : L"已关闭开机自启");
     } else if (cmd == 5) {
-        wchar_t exe[MAX_PATH];
-        if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
-            wstring cmdLine = L"\"" + wstring(exe) + L"\" --mail-setup";
-            STARTUPINFOW si = { sizeof(si) };
-            PROCESS_INFORMATION pi = {};
-            if (CreateProcessW(nullptr, cmdLine.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE,
-                               nullptr, nullptr, &si, &pi)) {
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-                Balloon(kAppTitle, L"请在打开的控制台窗口完成邮箱设置，设置后重启本程序生效");
-            }
-        }
+        ShowMailManager();
     } else if (cmd == 4) {
         DestroyWindow(g_hwnd);
     }
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (g_showMailMsg && msg == g_showMailMsg) {
+        ShowMailManager();
+        return 0;
+    }
     switch (msg) {
     case WM_TIMER:
         if (wParam == kTimerId) PollNewNotifications(false);
@@ -895,7 +1528,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 static int RunDaemon() {
     HANDLE instance = CreateMutexW(nullptr, FALSE, L"Local\\PhoneLinkCode_SingleInstance");
     if (instance && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
-
     if (!sql::Load()) {
         MessageBoxW(nullptr, L"无法加载 winsqlite3.dll。\n该组件由 Windows 10 1709 及以上自带。", kAppTitle, MB_ICONERROR);
         return 1;
@@ -917,7 +1549,7 @@ static int RunDaemon() {
         Log(L"首次运行，从当前最新通知开始监听 (last_id=" + std::to_wstring(g_lastId) + L")");
     }
 
-    const wchar_t* cls = L"PhoneLinkCodeHiddenWindow";
+    const wchar_t* cls = kHiddenClass;
     HICON appIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
     if (!appIcon) appIcon = LoadIconW(nullptr, IDI_APPLICATION);
     WNDCLASSEXW wc = {};
@@ -932,6 +1564,7 @@ static int RunDaemon() {
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, cls, kAppTitle, 0, 0, 0, 0, 0,
                              nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) return 1;
+    g_showMailMsg = RegisterWindowMessageW(kShowMailMsgName);
 
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_hwnd;
@@ -950,6 +1583,8 @@ static int RunDaemon() {
         Balloon(kAppTitle, L"已启动：短信和 " + std::to_wstring(n) + L" 个邮箱的验证码都会自动复制到剪贴板");
     } else
         Balloon(kAppTitle, L"已启动，收到短信验证码后将自动复制到剪贴板");
+
+    if (g_mailUiAtStart) ShowMailManager();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -978,7 +1613,8 @@ static void ShowUsage() {
         L"  PhoneLinkCode.exe --install      加入当前用户的开机启动项\r\n"
         L"  PhoneLinkCode.exe --uninstall    移除开机启动项\r\n\r\n"
         L"邮箱（可配置多个账号，浏览器网页邮箱也可用，需开启 IMAP）:\r\n"
-        L"  PhoneLinkCode.exe --mail-setup   交互式添加/更新邮箱（授权码用 DPAPI 加密保存在本机）\r\n"
+        L"  PhoneLinkCode.exe --mail-ui     打开邮箱管理窗口（图形界面，可添加/编辑/停用/删除）\r\n"
+        L"  PhoneLinkCode.exe --mail-setup   在控制台交互式添加/更新邮箱（授权码用 DPAPI 加密保存在本机）\r\n"
         L"  PhoneLinkCode.exe --mail-list    列出已配置的邮箱\r\n"
         L"  PhoneLinkCode.exe --mail-check [N]  立即检查所有邮箱最近 N 封邮件（默认 5）\r\n"
         L"  PhoneLinkCode.exe --mail-parse FILE 解析 .eml 文件并测试验证码提取\r\n"
@@ -1053,6 +1689,19 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             MailSetupInteractive();
             LocalFree(argv);
             return 0;
+        }
+        if (argIs(L"--mail-ui")) {
+            HWND existing = FindWindowW(kHiddenClass, nullptr);
+            if (existing) {
+                UINT m = RegisterWindowMessageW(kShowMailMsgName);
+                if (m) PostMessageW(existing, m, 0, 0);
+                LocalFree(argv);
+                return 0;
+            }
+            g_mailUiAtStart = true;
+            int rc = RunDaemon();
+            LocalFree(argv);
+            return rc;
         }
         if (argIs(L"--mail-check")) {
             EnsureConsole();

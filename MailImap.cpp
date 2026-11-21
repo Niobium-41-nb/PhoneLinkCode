@@ -1522,6 +1522,139 @@ bool MailList() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// 图形界面使用的接口
+// ---------------------------------------------------------------------------
+
+std::vector<MailAccountInfo> MailGetAccounts() {
+    LoadConfig();
+    std::vector<MailAccountInfo> out;
+    out.reserve(g_cfgs.size());
+    for (const auto& c : g_cfgs)
+        out.push_back(MailAccountInfo{ c.email, c.host, c.port, c.enabled, !c.secretB64.empty() });
+    return out;
+}
+
+std::wstring MailGuessHost(const std::wstring& email) {
+    return GuessImapHost(email);
+}
+
+bool MailTestAccount(const std::wstring& secretOwnerEmail, const std::wstring& email,
+                     const std::wstring& host, int port, const std::wstring& secretIn,
+                     std::wstring& message, long long& uidValidity, long long& uidNext) {
+    LoadConfig();
+    wstring secret = secretIn;
+    if (secret.empty()) {
+        wstring owner = secretOwnerEmail.empty() ? email : secretOwnerEmail;
+        MailConfig* c = FindAccount(owner);
+        if (!c) { message = L"请填写授权码/密码。"; return false; }
+        if (!UnprotectSecret(WideToUtf8(c->secretB64), secret) || secret.empty()) {
+            message = L"无法复用已保存的授权码，请重新输入。";
+            return false;
+        }
+    }
+
+    ImapClient imap;
+    wstring err;
+    if (!imap.Connect(host, port, err)) {
+        message = L"连接失败：" + err;
+        return false;
+    }
+    if (!imap.Login(email, secret, err)) {
+        message = L"登录失败：" + err +
+                  L"\n请确认填写的是邮箱生成的“授权码/应用专用密码”，并且已在邮箱设置中开启 IMAP。";
+        return false;
+    }
+    if (!imap.Examine(uidValidity, uidNext, err)) {
+        message = L"打开收件箱失败：" + err;
+        return false;
+    }
+    imap.Logout();
+    message = L"连接成功：" + host + L":" + std::to_wstring(port) + L" 可正常读取收件箱。";
+    return true;
+}
+
+bool MailSaveAccount(const std::wstring& oldEmail, const std::wstring& email,
+                     const std::wstring& host, int port, const std::wstring& secret,
+                     bool enabled, long long uidValidity, long long uidNext,
+                     std::wstring& message) {
+    LoadConfig();
+    bool isNew = oldEmail.empty();
+    MailConfig* existing = isNew ? nullptr : FindAccount(oldEmail);
+    if (!isNew && !existing) {
+        message = L"未找到原邮箱配置，请关闭窗口后重新打开。";
+        return false;
+    }
+    MailConfig* clash = FindAccount(email);
+    if (clash && clash != existing) {
+        message = L"邮箱已存在：" + email + L"，可直接编辑该账号。";
+        return false;
+    }
+
+    wstring plain = secret;
+    if (plain.empty()) {
+        if (!existing || !UnprotectSecret(WideToUtf8(existing->secretB64), plain) || plain.empty()) {
+            message = L"请填写授权码/密码。";
+            return false;
+        }
+    }
+    string blob = ProtectSecret(plain);
+    if (blob.empty()) {
+        message = L"凭据加密保存失败。";
+        return false;
+    }
+
+    MailConfig c;
+    if (existing) {
+        c = *existing;
+    } else {
+        c.section = L"mail." + std::to_wstring(NextSectionNumber());
+        c.pollSeconds = 10;
+    }
+    bool sameMailbox = existing && _wcsicmp(existing->email.c_str(), email.c_str()) == 0 &&
+                       _wcsicmp(existing->host.c_str(), host.c_str()) == 0 && existing->port == port;
+    if (!sameMailbox) {
+        c.uidValidity = uidValidity;
+        c.lastUid = uidNext > 0 ? uidNext - 1 : 0;
+    }
+    c.enabled = enabled;
+    c.email = email;
+    c.host = host;
+    c.port = port;
+    c.secretB64 = Utf8ToWide(blob);
+    SaveAccount(c);
+    LoadConfig();
+    message = (isNew ? L"已新增邮箱：" : L"已更新邮箱：") + email;
+    return true;
+}
+
+bool MailSetEnabled(const std::wstring& email, bool enabled, std::wstring& message) {
+    LoadConfig();
+    MailConfig* c = FindAccount(email);
+    if (!c) { message = L"未找到邮箱：" + email; return false; }
+    c->enabled = enabled;
+    IniWrite(c->section, L"enabled", enabled ? L"1" : L"0");
+    message = (enabled ? L"已启用：" : L"已停用：") + email;
+    return true;
+}
+
+bool MailRemoveAccount(const std::wstring& email, std::wstring& message) {
+    LoadConfig();
+    MailConfig* c = FindAccount(email);
+    if (!c) { message = L"未找到邮箱：" + email; return false; }
+    wstring section = c->section;
+    IniDeleteSection(section);
+    LoadConfig();
+    message = L"已删除邮箱：" + email;
+    return true;
+}
+
+void MailReloadWorkers(HWND notifyWnd) {
+    MailStopWorker();
+    LoadConfig();
+    MailStartWorker(notifyWnd);
+}
+
 static void CheckOneAccount(const MailConfig& c, int count) {
     AppPrint(L"\r\n========== " + c.email + L" (" + c.host + L":" + std::to_wstring(c.port) + L") ==========\r\n");
     wstring secret;

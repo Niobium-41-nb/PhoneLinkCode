@@ -9,6 +9,7 @@
 - **短信**：轮询 Windows 通知数据库 `wpndatabase.db`，只读取「手机连接」写入的短信通知，按「验证码/校验码/动态码/code…」等关键字邻近规则提取 4–8 位数字。
 - **邮箱**：IMAP over TLS 只读监控（`EXAMINE INBOX` + `BODY.PEEK[]`，**不会把邮件标记为已读**），支持 QQ / 163 / 126 / 企业微信邮箱 / 139 / 阿里 / Gmail 等。
 - **多邮箱并行**：可添加任意多个邮箱账号，每个账号独立线程、独立监听进度，一个账号故障不影响其他账号。
+- **原生图形界面配置**：托盘右键「管理邮箱验证码…」或运行 `--mail-ui` 打开 Win32 窗口，添加、编辑、停用、删除邮箱；保存前先实际连接登录验证，配置修改后立即生效，无需重启程序。
 - 支持 multipart、base64、quoted-printable、RFC 2047 编码主题、UTF-8/GBK/GB18030/Big5 等字符集，以及 HTML 邮件（验证码被 `<span>` 拆开也能合并识别）。
 - 只处理 **10 分钟内**的新消息，避免把历史验证码误贴进剪贴板。
 - 托盘图标、单实例、开机自启、日志查看。
@@ -34,11 +35,11 @@ build.bat
 cl /nologo /W4 /O2 /MT /std:c++17 /EHsc /utf-8 /DUNICODE /D_UNICODE ^
    PhoneLinkCode.cpp MailImap.cpp app.res ^
    /Fe:PhoneLinkCode.exe ^
-   /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib advapi32.lib ole32.lib ^
+   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib advapi32.lib ole32.lib ^
    ws2_32.lib crypt32.lib secur32.lib
 ```
 
-成功后得到 `PhoneLinkCode.exe`：`/MT` 静态链接 C/C++ 运行库，导入表里只有 `user32/shell32/advapi32/ole32/ws2_32/crypt32/secur32/kernel32`，拷到别的 Windows 机器上无需安装 VC++ 运行库。
+成功后得到 `PhoneLinkCode.exe`：`/MT` 静态链接 C/C++ 运行库，导入表里只有 `user32/gdi32/shell32/advapi32/ole32/ws2_32/crypt32/secur32/kernel32`，拷到别的 Windows 机器上无需安装 VC++ 运行库。
 
 > 源码含中文，必须保留 `/utf-8`，否则会出现乱码或 C4819 警告。
 
@@ -48,9 +49,17 @@ cl /nologo /W4 /O2 /MT /std:c++17 /EHsc /utf-8 /DUNICODE /D_UNICODE ^
 
 双击 `PhoneLinkCode.exe`（或命令行不带参数运行）。程序没有主窗口，只出现在托盘：
 
-- 右键托盘图标：立即扫描 / 打开日志 / 开机自动启动 / 设置（或重新设置）邮箱验证码监控 / 退出。
+- 右键托盘图标：立即扫描 / 打开日志 / 开机自动启动 / 管理邮箱验证码（原生窗口） / 退出。
 - 双击托盘图标：打开 `app.log`。
 - 托盘提示（Win11 里可能在折叠区）：每次复制验证码都会弹出气泡。
+
+也可以从终端打开邮箱管理窗口：
+
+```bat
+PhoneLinkCode.exe --mail-ui
+```
+
+若后台程序已在运行，会直接把它的管理窗口叫到前台；未运行则按后台模式启动并打开窗口。
 
 开机自启：
 
@@ -87,7 +96,14 @@ PhoneLinkCode.exe --extract "【某网站】您的验证码是 847219，10 分�
 | Gmail | 设置 → 转发和 POP/IMAP → 启用 IMAP | 需先开两步验证，用**应用专用密码** |
 | 139 / 阿里云邮箱 | 邮箱设置中开启 IMAP | 邮箱生成的授权码 |
 
-然后在控制台运行交互式配置：
+然后在托盘右键选择「管理邮箱验证码…」（或运行 `PhoneLinkCode.exe --mail-ui`）打开管理窗口：
+
+- 列表显示已配置的邮箱、服务器和启停状态；选中后可「编辑…」「删除」或「启用/停用」。
+- 「添加邮箱…」打开表单，填写邮箱地址、IMAP 服务器（按域名自动带出）、端口和授权码/密码。
+- 点「测试并保存」会先连接邮箱、登录并打开收件箱验证；验证通过才写入配置并立即重启后台监控，**无需退出程序**。
+- 编辑已有邮箱时授权码留空即沿用已保存的授权码（不会显示明文）。
+
+也可以在控制台运行交互式配置（功能相同，适合远程/无桌面环境）：
 
 ```bat
 PhoneLinkCode.exe --mail-setup
@@ -104,7 +120,7 @@ PhoneLinkCode.exe --mail-setup
 
 重复运行 `--mail-setup` 即可继续添加更多邮箱。每个账号在后台各有一个监控线程，日志和托盘气泡都会带上邮箱地址；某个账号连不上不会影响其他账号。
 
-> 修改配置后需要重启后台程序（托盘右键 → 退出，再打开）才会生效。
+> 用 `--mail-setup` 或手工修改 `mail.ini` 后，需要重启后台程序（托盘右键 → 退出，再打开）才会生效；在图形界面里保存的配置会立即生效。
 
 验证与排错命令：
 
@@ -128,6 +144,7 @@ PhoneLinkCode.exe --mail-remove someone@qq.com    :: 删除指定邮箱配置
 | *(无参数)* | 后台托盘运行：每 2 秒查短信，按 `poll_seconds`（默认 10 秒）查各邮箱 |
 | `--list [N]` | 列出最近 N 条手机连接短信及提取结果，默认 10，最大 500 |
 | `--extract "文本"` | 测试验证码提取逻辑，只打印结果，不写剪贴板 |
+| `--mail-ui` | 打开邮箱管理窗口（已运行时叫出它现有的窗口，否则后台启动并打开） |
 | `--mail-setup` | 交互式添加 / 更新邮箱（可配置多个） |
 | `--mail-list` | 列出已配置的邮箱、服务器、启停状态与监听进度 |
 | `--mail-check [N]` | 依次检查所有邮箱最近 N 封邮件，默认 5，最大 50 |
@@ -183,6 +200,6 @@ last_uid=1524
 - **短信收不到**：确认「手机连接」能在 PC 弹出短信通知；Windows 通知被关闭/免打扰时不会写入数据库。用 `--list` 自查。
 - **邮箱登录失败**：绝大多数情况是用了登录密码而不是授权码，或没在邮箱设置里开启 IMAP。用 `--mail-ping` 先确认网络/TLS 可达。
 - **163 邮箱超时**：程序已优先使用 IPv4（部分邮箱的 IPv6 入口能握手但不返回 IMAP 问候）；仍失败时检查本机 IPv6 代理/防火墙。
-- **修改 `mail.ini` 或重新 `--mail-setup` 后不生效**：退出托盘程序再启动。
+- **修改 `mail.ini` 或重新 `--mail-setup` 后不生效**：退出托盘程序再启动；用图形界面修改的配置保存后已自动生效。
 - **某个邮箱停止检查**：看 `app.log` 中该邮箱的日志；`--mail-check` 会逐个账号显示连接/登录错误。某个账号失败不会影响其他账号。
 - **想清空历史状态**：关闭程序后删除 `%LOCALAPPDATA%\PhoneLinkCode\state.txt`（短信进度），或删除 `mail.ini` 中对应 `[mail.N]` 段的 `uidvalidity`/`last_uid` 两行（该邮箱从最新邮件重新开始）。
