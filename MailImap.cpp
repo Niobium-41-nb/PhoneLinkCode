@@ -500,14 +500,16 @@ bool TlsSocket::DecryptPending(wstring& err) {
 
 bool TlsSocket::Fill(wstring& err) {
     if (!DecryptPending(err)) return false;
-    if (!plain_.empty()) return true;
-    while (true) {
+    // 已解出的明文可能只是半行（服务器按自身缓冲切分记录），此时必须继续读网络，
+    // 否则调用方 snoop 到非空 plain_ 会原地空转
+    size_t before = plain_.size();
+    while (plain_.size() == before) {
         string more;
         if (!NetRecv(more, err)) return false;
         raw_ += more;
         if (!DecryptPending(err)) return false;
-        if (!plain_.empty()) return true;
     }
+    return true;
 }
 
 bool TlsSocket::ReadLine(string& line, wstring& err) {
@@ -1179,6 +1181,7 @@ struct ParsedMail {
     wstring body;
     bool hasDate = false;
     ULONGLONG dateFileTime = 0;
+    string dateRaw;
 };
 
 static bool ParseMail(const string& raw, ParsedMail& out) {
@@ -1187,6 +1190,7 @@ static bool ParseMail(const string& raw, ParsedMail& out) {
     out.subject = DecodeMimeHeader(HeaderValue(hdrs, "subject"));
     out.from = DecodeMimeHeader(HeaderValue(hdrs, "from"));
     string dateHdr = HeaderValue(hdrs, "date");
+    out.dateRaw = dateHdr;
     FILETIME ft;
     if (!dateHdr.empty() && ParseRfc2822Date(dateHdr, ft)) {
         out.hasDate = true;
@@ -1378,6 +1382,11 @@ void MailCheckRecent(int count) {
         AppPrint(L"UID " + std::to_wstring(uid) + L"\r\n");
         AppPrint(L"  发件人: " + SafeOneLine(mail.from, 120) + L"\r\n");
         AppPrint(L"  主题  : " + SafeOneLine(mail.subject, 120) + L"\r\n");
+        wstring dateInfo = mail.dateRaw.empty() ? L"（无 Date 头）" : Utf8ToWide(mail.dateRaw);
+        if (mail.hasDate) {
+            dateInfo += L"（" + std::to_wstring(MailAgeMinutes(mail.dateFileTime)) + L" 分钟前）";
+        }
+        AppPrint(L"  时间  : " + SafeOneLine(dateInfo, 160) + L"\r\n");
         AppPrint(L"  验证码: " + (code.empty() ? wstring(L"（未找到）") : code) + L"\r\n\r\n");
     }
     imap.Logout();
