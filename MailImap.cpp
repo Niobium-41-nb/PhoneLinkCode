@@ -143,7 +143,7 @@ struct MailConfig {
     wstring host;
     int port = 993;
     wstring secretB64;          // DPAPI 加密后的授权码
-    int pollSeconds = 10;
+    int pollSeconds = 3;
     long long uidValidity = 0;
     long long lastUid = 0;
 };
@@ -206,7 +206,7 @@ static MailConfig LoadAccount(const wstring& sec) {
     int port = IniInt(sec, L"port", 993);
     c.port = port > 0 && port < 65536 ? port : 993;
     c.secretB64 = IniString(sec, L"secret");
-    int poll = IniInt(sec, L"poll_seconds", 10);
+    int poll = IniInt(sec, L"poll_seconds", 3);
     c.pollSeconds = poll < 3 ? 3 : (poll > 300 ? 300 : poll);
     c.uidValidity = _wtoi64(IniString(sec, L"uidvalidity").c_str());
     c.lastUid = _wtoi64(IniString(sec, L"last_uid").c_str());
@@ -254,7 +254,7 @@ static void MigrateLegacyConfig() {
     int port = IniInt(L"imap", L"port", 993);
     c.port = port > 0 && port < 65536 ? port : 993;
     c.secretB64 = IniString(L"imap", L"secret");
-    int poll = IniInt(L"imap", L"poll_seconds", 10);
+    int poll = IniInt(L"imap", L"poll_seconds", 3);
     c.pollSeconds = poll < 3 ? 3 : (poll > 300 ? 300 : poll);
     c.uidValidity = _wtoi64(IniString(L"state", L"uidvalidity").c_str());
     c.lastUid = _wtoi64(IniString(L"state", L"last_uid").c_str());
@@ -323,6 +323,7 @@ public:
     bool SendAll(const string& data, wstring& err) { return SendEncrypted(data, err); }
     bool ReadLine(string& line, wstring& err);
     bool ReadExact(size_t n, string& out, wstring& err);
+    bool WaitReadable(int ms);
 
 private:
     SOCKET sock_ = INVALID_SOCKET;
@@ -637,6 +638,18 @@ bool TlsSocket::ReadExact(size_t n, string& out, wstring& err) {
     return true;
 }
 
+bool TlsSocket::WaitReadable(int ms) {
+    if (!plain_.empty() || !raw_.empty()) return true;
+    if (sock_ == INVALID_SOCKET) return false;
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(sock_, &rd);
+    timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    return select(0, &rd, nullptr, nullptr, &tv) > 0;
+}
+
 bool TlsSocket::SendEncrypted(const string& data, wstring& err) {
     if (!ctxOk_) { err = L"TLS 未建立"; return false; }
     SecPkgContext_StreamSizes sizes = {};
@@ -696,6 +709,7 @@ public:
     bool SearchNew(long long afterUid, vector<long long>& uids, wstring& err);
     bool FetchSize(long long uid, long long& size, wstring& err);
     bool FetchRaw(long long uid, size_t maxSize, string& raw, wstring& err);
+    bool IdleWait(int waitMs, HANDLE stopEvent, bool& newMail, bool& supported, wstring& err);
     void Logout();
 
 private:
@@ -864,6 +878,59 @@ bool ImapClient::FetchRaw(long long uid, size_t maxSize, string& raw, wstring& e
     for (const auto& lit : r.literals)
         if (!best || lit.size() > best->size()) best = &lit;
     if (best) raw = *best;
+    return true;
+}
+
+bool ImapClient::IdleWait(int waitMs, HANDLE stopEvent, bool& newMail, bool& supported, wstring& err) {
+    newMail = false;
+    supported = true;
+    tag_++;
+    string tag = "a" + std::to_string(tag_);
+    if (!tls_.SendAll(tag + " IDLE\r\n", err)) return false;
+
+    bool idling = false;
+    while (!idling) {
+        string line;
+        if (!tls_.ReadLine(line, err)) return false;
+        if (line.rfind("* BYE", 0) == 0) { err = L"IMAP 会话被服务器关闭"; return false; }
+        if (!line.empty() && line[0] == '+') {
+            idling = true;
+        } else if (line.size() >= tag.size() && line.compare(0, tag.size(), tag) == 0) {
+            supported = false;
+            err = Utf8ToWide(line);
+            return true;
+        }
+    }
+
+    DWORD start = GetTickCount();
+    bool stopped = false;
+    while ((int)(GetTickCount() - start) < waitMs) {
+        if (stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) { stopped = true; break; }
+        if (!tls_.WaitReadable(500)) continue;
+        string line;
+        if (!tls_.ReadLine(line, err)) return false;
+        if (line.rfind("* BYE", 0) == 0) { err = L"IMAP 会话被服务器关闭"; return false; }
+        if (line.rfind("* ", 0) == 0 && line.find(" EXISTS") != string::npos) {
+            newMail = true;
+            break;
+        }
+    }
+
+    if (!tls_.SendAll("DONE\r\n", err)) return false;
+    while (!stopped) {
+        string line;
+        if (!tls_.ReadLine(line, err)) return false;
+        if (line.rfind("* BYE", 0) == 0) { err = L"IMAP 会话被服务器关闭"; return false; }
+        if (line.rfind("* ", 0) == 0 && line.find(" EXISTS") != string::npos) newMail = true;
+        if (line.size() >= tag.size() && line.compare(0, tag.size(), tag) == 0 &&
+            (line.size() == tag.size() || line[tag.size()] == ' ')) {
+            if (line.find(" OK") == string::npos) {
+                err = Utf8ToWide(line);
+                return false;
+            }
+            break;
+        }
+    }
     return true;
 }
 
@@ -1459,7 +1526,7 @@ bool MailSetupInteractive() {
         c.section = L"mail." + std::to_wstring(NextSectionNumber());
         c.uidValidity = uidValidity;
         c.lastUid = uidNext > 0 ? uidNext - 1 : 0;
-        c.pollSeconds = 10;
+        c.pollSeconds = 3;
     }
     c.enabled = true;
     c.email = email;
@@ -1609,7 +1676,7 @@ bool MailSaveAccount(const std::wstring& oldEmail, const std::wstring& email,
         c = *existing;
     } else {
         c.section = L"mail." + std::to_wstring(NextSectionNumber());
-        c.pollSeconds = 10;
+        c.pollSeconds = 3;
     }
     bool sameMailbox = existing && _wcsicmp(existing->email.c_str(), email.c_str()) == 0 &&
                        _wcsicmp(existing->host.c_str(), host.c_str()) == 0 && existing->port == port;
@@ -1867,6 +1934,8 @@ static bool MailSessionLoop(WorkerCtx& ctx, const wstring& secret) {
         SaveState(c);
     }
 
+    bool idleOk = true;
+    bool idleLogged = false;
     while (!StopRequested()) {
         vector<long long> uids;
         if (!imap.SearchNew(c.lastUid, uids, err)) {
@@ -1885,6 +1954,26 @@ static bool MailSessionLoop(WorkerCtx& ctx, const wstring& secret) {
             SaveState(c);
             if (!raw.empty()) HandleMailMessage(c, raw);
         }
+        if (idleOk) {
+            bool newMail = false, supported = true;
+            if (!imap.IdleWait(120000, g_stopEvent, newMail, supported, err)) {
+                AppLog(AccountTag(c) + L"IMAP IDLE 中断: " + err);
+                return false;
+            }
+            if (!supported) {
+                idleOk = false;
+                AppLog(AccountTag(c) + L"服务器不支持 IDLE，改用 " +
+                       std::to_wstring(c.pollSeconds) + L" 秒轮询");
+                continue;
+            }
+            if (!idleLogged) {
+                idleLogged = true;
+                AppLog(AccountTag(c) + L"IMAP IDLE 推送已启用，新邮件即时收取");
+            }
+            if (newMail) AppLog(AccountTag(c) + L"IDLE 收到新邮件通知");
+            else if (StopRequested()) break;
+            continue;
+        }
         if (SleepStop(c.pollSeconds * 1000)) break;
     }
     imap.Logout();
@@ -1899,13 +1988,13 @@ static DWORD WINAPI MailThread(LPVOID param) {
         return 0;
     }
 
-    int backoff = 5;
+    int backoff = 2;
     while (!StopRequested()) {
         if (MailSessionLoop(*ctx, secret)) {
-            backoff = 5;
+            backoff = 2;
         } else {
             if (SleepStop(backoff * 1000)) break;
-            backoff = backoff * 2 > 60 ? 60 : backoff * 2;
+            backoff = backoff * 2 > 15 ? 15 : backoff * 2;
         }
     }
     return 0;
