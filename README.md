@@ -7,7 +7,13 @@
 ## 下载
 
 - 最新发行版：[GitHub Releases](https://github.com/Niobium-41-nb/PhoneLinkCode/releases/latest)
-- v1.0.0（免编译，解压即用）：[PhoneLinkCode-win64.zip](https://github.com/Niobium-41-nb/PhoneLinkCode/releases/download/v1.0.0/PhoneLinkCode-win64.zip)（已静态链接运行库，无需安装 VC++ 运行库）
+- v1.0.0 安装包：[PhoneLinkCode-Setup-1.0.0.exe](https://github.com/Niobium-41-nb/PhoneLinkCode/releases/download/v1.0.0/PhoneLinkCode-Setup-1.0.0.exe)（双击安装，自动创建开始菜单快捷方式；静态链接运行库，无需安装 VC++ 运行库；无需管理员权限）
+
+```powershell
+# 静默安装 / 卸载
+PhoneLinkCode-Setup-1.0.0.exe /S
+PhoneLinkCode-Setup-1.0.0.exe --uninstall --silent
+```
 
 ## 功能
 
@@ -47,6 +53,16 @@ cl /nologo /W4 /O2 /MT /std:c++17 /EHsc /utf-8 /DUNICODE /D_UNICODE ^
 成功后得到 `PhoneLinkCode.exe`：`/MT` 静态链接 C/C++ 运行库，导入表里只有 `user32/gdi32/shell32/advapi32/ole32/ws2_32/crypt32/secur32/kernel32`，拷到别的 Windows 机器上无需安装 VC++ 运行库。
 
 > 源码含中文，必须保留 `/utf-8`，否则会出现乱码或 C4819 警告。
+
+## 制作安装包
+
+在 `PhoneLinkCode.exe` 构建完成后运行：
+
+```bat
+build-installer.bat
+```
+
+输出 `PhoneLinkCode-Setup-1.0.0.exe`。安装包内嵌程序、README 与图标，不依赖 Inno Setup / NSIS：按用户安装到 `%LOCALAPPDATA%\Programs\PhoneLinkCode`，创建开始菜单快捷方式与「应用和功能」卸载项，无需管理员权限；支持 `/S` 静默安装、`--uninstall --silent` 静默卸载，卸载时保留邮箱配置与日志。
 
 ## 使用
 
