@@ -4,6 +4,11 @@
 
 纯 Win32 + C++17 实现，不依赖任何第三方库（SQLite 走系统自带的 `winsqlite3.dll`，TLS 走系统 Schannel）。
 
+## 下载
+
+- 最新发行版：[GitHub Releases](https://github.com/Niobium-41-nb/PhoneLinkCode/releases/latest)
+- v1.0.0（免编译，解压即用）：[PhoneLinkCode-win64.zip](https://github.com/Niobium-41-nb/PhoneLinkCode/releases/download/v1.0.0/PhoneLinkCode-win64.zip)（已静态链接运行库，无需安装 VC++ 运行库）
+
 ## 功能
 
 - **短信**：轮询 Windows 通知数据库 `wpndatabase.db`，只读取「手机连接」写入的短信通知，按「验证码/校验码/动态码/code…」等关键字邻近规则提取 4–8 位数字。
