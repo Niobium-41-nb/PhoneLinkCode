@@ -6,6 +6,7 @@
 *.ilk
 *.lib
 *.exp
+dist/
 
 # Runtime data (credentials live in %LOCALAPPDATA%\PhoneLinkCode)
 mail.ini
