@@ -9,7 +9,7 @@ if not defined VSDIR goto no_vs
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
 rc /nologo app.rc
 if errorlevel 1 goto build_failed
-cl /nologo /W4 /O2 /std:c++17 /EHsc /utf-8 /DUNICODE /D_UNICODE PhoneLinkCode.cpp MailImap.cpp app.res /Fe:PhoneLinkCode.exe /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib advapi32.lib ole32.lib ws2_32.lib crypt32.lib secur32.lib
+cl /nologo /W4 /O2 /MT /std:c++17 /EHsc /utf-8 /DUNICODE /D_UNICODE PhoneLinkCode.cpp MailImap.cpp app.res /Fe:PhoneLinkCode.exe /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib advapi32.lib ole32.lib ws2_32.lib crypt32.lib secur32.lib
 if errorlevel 1 goto build_failed
 echo Build OK: PhoneLinkCode.exe
 exit /b 0
