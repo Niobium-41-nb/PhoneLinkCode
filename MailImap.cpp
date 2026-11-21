@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <memory>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -135,6 +137,7 @@ static string Base64Decode(const string& s) {
 // ---------------------------------------------------------------------------
 
 struct MailConfig {
+    wstring section;            // mail.1 / mail.2 ...
     bool enabled = false;
     wstring email;
     wstring host;
@@ -145,36 +148,136 @@ struct MailConfig {
     long long lastUid = 0;
 };
 
-static MailConfig g_cfg;
+static vector<MailConfig> g_cfgs;
 static wstring g_cfgPath;
+static std::mutex g_iniLock;
 
-static wstring IniString(const wchar_t* sec, const wchar_t* key) {
+static int IniInt(const wstring& sec, const wchar_t* key, int def) {
+    return (int)GetPrivateProfileIntW(sec.c_str(), key, def, g_cfgPath.c_str());
+}
+
+static wstring IniString(const wstring& sec, const wchar_t* key) {
     wchar_t buf[2048] = {};
-    GetPrivateProfileStringW(sec, key, L"", buf, 2048, g_cfgPath.c_str());
+    GetPrivateProfileStringW(sec.c_str(), key, L"", buf, 2048, g_cfgPath.c_str());
     return buf;
 }
 
-static void IniWrite(const wchar_t* sec, const wchar_t* key, const wstring& value) {
-    WritePrivateProfileStringW(sec, key, value.c_str(), g_cfgPath.c_str());
+static void IniWrite(const wstring& sec, const wstring& key, const wstring& value) {
+    std::lock_guard<std::mutex> lock(g_iniLock);
+    WritePrivateProfileStringW(sec.c_str(), key.c_str(), value.c_str(), g_cfgPath.c_str());
+}
+
+static void IniDeleteSection(const wstring& sec) {
+    std::lock_guard<std::mutex> lock(g_iniLock);
+    WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, g_cfgPath.c_str());
+}
+
+static vector<wstring> IniSections() {
+    vector<wstring> out;
+    DWORD size = 4096;
+    vector<wchar_t> buf;
+    for (int tries = 0; tries < 4; ++tries) {
+        buf.assign(size, L'\0');
+        DWORD n = GetPrivateProfileSectionNamesW(buf.data(), size, g_cfgPath.c_str());
+        if (n >= size - 2) { size *= 2; continue; }
+        for (DWORD i = 0; i < n;) {
+            wstring s(buf.data() + i);
+            i += (DWORD)s.size() + 1;
+            if (!s.empty()) out.push_back(s);
+        }
+        return out;
+    }
+    return out;
+}
+
+static bool SectionLess(const wstring& a, const wstring& b) {
+    long long na = _wtoi64(a.c_str() + 5);
+    long long nb = _wtoi64(b.c_str() + 5);
+    if (na != nb) return na < nb;
+    return a < b;
+}
+
+static MailConfig LoadAccount(const wstring& sec) {
+    MailConfig c;
+    c.section = sec;
+    c.enabled = IniInt(sec, L"enabled", 0) != 0;
+    c.email = IniString(sec, L"email");
+    c.host = IniString(sec, L"host");
+    int port = IniInt(sec, L"port", 993);
+    c.port = port > 0 && port < 65536 ? port : 993;
+    c.secretB64 = IniString(sec, L"secret");
+    int poll = IniInt(sec, L"poll_seconds", 10);
+    c.pollSeconds = poll < 3 ? 3 : (poll > 300 ? 300 : poll);
+    c.uidValidity = _wtoi64(IniString(sec, L"uidvalidity").c_str());
+    c.lastUid = _wtoi64(IniString(sec, L"last_uid").c_str());
+    return c;
+}
+
+static void SaveState(const MailConfig& c) {
+    IniWrite(c.section, L"uidvalidity", std::to_wstring(c.uidValidity));
+    IniWrite(c.section, L"last_uid", std::to_wstring(c.lastUid));
+}
+
+static void SaveAccount(const MailConfig& c) {
+    IniWrite(c.section, L"enabled", c.enabled ? L"1" : L"0");
+    IniWrite(c.section, L"email", c.email);
+    IniWrite(c.section, L"host", c.host);
+    IniWrite(c.section, L"port", std::to_wstring(c.port));
+    IniWrite(c.section, L"secret", c.secretB64);
+    IniWrite(c.section, L"poll_seconds", std::to_wstring(c.pollSeconds));
+    SaveState(c);
+}
+
+static bool ConfigComplete(const MailConfig& c) {
+    return !c.email.empty() && !c.host.empty() && !c.secretB64.empty();
+}
+
+static MailConfig* FindAccount(const wstring& email) {
+    for (auto& c : g_cfgs)
+        if (!c.email.empty() && _wcsicmp(c.email.c_str(), email.c_str()) == 0) return &c;
+    return nullptr;
+}
+
+// 旧版单邮箱配置（[imap]/[state]）自动迁移为 [mail.1]
+static void MigrateLegacyConfig() {
+    wstring email = IniString(L"imap", L"email");
+    if (email.empty()) return;
+
+    wstring backup = g_cfgPath + L".bak";
+    CopyFileW(g_cfgPath.c_str(), backup.c_str(), FALSE);
+
+    MailConfig c;
+    c.section = L"mail.1";
+    c.enabled = IniInt(L"imap", L"enabled", 0) != 0;
+    c.email = email;
+    c.host = IniString(L"imap", L"host");
+    int port = IniInt(L"imap", L"port", 993);
+    c.port = port > 0 && port < 65536 ? port : 993;
+    c.secretB64 = IniString(L"imap", L"secret");
+    int poll = IniInt(L"imap", L"poll_seconds", 10);
+    c.pollSeconds = poll < 3 ? 3 : (poll > 300 ? 300 : poll);
+    c.uidValidity = _wtoi64(IniString(L"state", L"uidvalidity").c_str());
+    c.lastUid = _wtoi64(IniString(L"state", L"last_uid").c_str());
+    c.enabled = c.enabled && ConfigComplete(c);
+
+    SaveAccount(c);
+    IniDeleteSection(L"state");
+    IniDeleteSection(L"imap");
+    g_cfgs.push_back(c);
+    AppLog(L"已将单邮箱配置迁移为多邮箱格式 [mail.1]，原文件备份为 mail.ini.bak");
 }
 
 static void LoadConfig() {
-    g_cfg = MailConfig();
-    g_cfg.enabled = GetPrivateProfileIntW(L"imap", L"enabled", 0, g_cfgPath.c_str()) != 0;
-    g_cfg.email = IniString(L"imap", L"email");
-    g_cfg.host = IniString(L"imap", L"host");
-    int port = GetPrivateProfileIntW(L"imap", L"port", 993, g_cfgPath.c_str());
-    g_cfg.port = port > 0 && port < 65536 ? port : 993;
-    g_cfg.secretB64 = IniString(L"imap", L"secret");
-    int poll = GetPrivateProfileIntW(L"imap", L"poll_seconds", 10, g_cfgPath.c_str());
-    g_cfg.pollSeconds = poll < 3 ? 3 : (poll > 300 ? 300 : poll);
-    g_cfg.uidValidity = _wtoi64(IniString(L"state", L"uidvalidity").c_str());
-    g_cfg.lastUid = _wtoi64(IniString(L"state", L"last_uid").c_str());
-}
-
-static void SaveState() {
-    IniWrite(L"state", L"uidvalidity", std::to_wstring(g_cfg.uidValidity));
-    IniWrite(L"state", L"last_uid", std::to_wstring(g_cfg.lastUid));
+    g_cfgs.clear();
+    vector<wstring> secs;
+    for (const auto& s : IniSections())
+        if (s.rfind(L"mail.", 0) == 0) secs.push_back(s);
+    std::sort(secs.begin(), secs.end(), SectionLess);
+    for (const auto& s : secs) {
+        MailConfig c = LoadAccount(s);
+        if (!c.email.empty()) g_cfgs.push_back(c);
+    }
+    if (g_cfgs.empty()) MigrateLegacyConfig();
 }
 
 static string ProtectSecret(const wstring& plain) {
@@ -240,13 +343,12 @@ private:
 };
 
 static bool WsaInit() {
+    static std::once_flag once;
     static bool ok = false;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
+    std::call_once(once, [] {
         WSADATA wd;
         ok = WSAStartup(MAKEWORD(2, 2), &wd) == 0;
-    }
+    });
     return ok;
 }
 
@@ -1262,27 +1364,63 @@ static wstring ReadConsoleLine(const wstring& prompt, bool secret) {
     return s;
 }
 
+static void PrintAccountList() {
+    if (g_cfgs.empty()) {
+        AppPrint(L"（尚未配置邮箱）\r\n");
+        return;
+    }
+    for (size_t i = 0; i < g_cfgs.size(); ++i) {
+        const MailConfig& c = g_cfgs[i];
+        AppPrint(L"  " + std::to_wstring(i + 1) + L") " + c.email + L"  " + c.host + L":" +
+                 std::to_wstring(c.port) + (c.enabled ? L"  [启用]" : L"  [已关闭]") + L"\r\n");
+    }
+}
+
+static int NextSectionNumber() {
+    int next = 1;
+    for (const auto& c : g_cfgs) {
+        int n = _wtoi(c.section.c_str() + 5);
+        if (n >= next) next = n + 1;
+    }
+    return next;
+}
+
 bool MailSetupInteractive() {
     AppEnsureConsole();
-    AppPrint(L"=== 邮箱验证码监控设置（IMAP 只读） ===\r\n"
+    LoadConfig();
+    AppPrint(L"=== 邮箱验证码监控设置（IMAP 只读，可添加多个邮箱） ===\r\n"
              L"说明：程序只读取新邮件正文用于提取验证码，不会修改已读状态。\r\n"
              L"授权码会使用 Windows DPAPI 加密后仅保存在本机。\r\n\r\n"
              L"QQ 邮箱：设置 -> 账号 -> 开启 IMAP/SMTP -> 生成授权码\r\n"
              L"163 邮箱：设置 -> POP3/SMTP/IMAP -> 开启 IMAP -> 新增授权密码\r\n"
              L"Gmail：需开启两步验证后使用“应用专用密码”\r\n\r\n");
+    AppPrint(L"已配置邮箱：\r\n");
+    PrintAccountList();
+    AppPrint(L"\r\n输入已有邮箱可更新其配置；输入新邮箱则新增一个账号。\r\n");
 
     wstring email = ReadConsoleLine(L"邮箱地址: ", false);
     if (email.empty()) { AppPrint(L"已取消。\r\n"); return false; }
+    MailConfig* existing = FindAccount(email);
 
-    wstring hostDef = GuessImapHost(email);
+    wstring hostDef = existing && !existing->host.empty() ? existing->host : GuessImapHost(email);
     wstring host = ReadConsoleLine(L"IMAP 服务器 [" + hostDef + L"]: ", false);
     if (host.empty()) host = hostDef;
 
-    wstring portStr = ReadConsoleLine(L"端口 [993]: ", false);
-    int port = portStr.empty() ? 993 : _wtoi(portStr.c_str());
-    if (port <= 0 || port > 65535) port = 993;
+    int portDef = existing ? existing->port : 993;
+    wstring portStr = ReadConsoleLine(L"端口 [" + std::to_wstring(portDef) + L"]: ", false);
+    int port = portStr.empty() ? portDef : _wtoi(portStr.c_str());
+    if (port <= 0 || port > 65535) port = portDef;
 
-    wstring secret = ReadConsoleLine(L"授权码/密码（输入不显示）: ", true);
+    wstring prompt = existing
+        ? L"授权码/密码（输入不显示，留空沿用已保存的）: "
+        : L"授权码/密码（输入不显示）: ";
+    wstring secret = ReadConsoleLine(prompt, true);
+    if (secret.empty() && existing) {
+        if (!UnprotectSecret(WideToUtf8(existing->secretB64), secret) || secret.empty()) {
+            AppPrint(L"无法复用已保存的授权码，请重新输入。\r\n");
+            secret = ReadConsoleLine(L"授权码/密码（输入不显示）: ", true);
+        }
+    }
     if (secret.empty()) { AppPrint(L"已取消。\r\n"); return false; }
 
     AppPrint(L"正在连接并测试登录...\r\n");
@@ -1311,46 +1449,91 @@ bool MailSetupInteractive() {
         return false;
     }
 
-    IniWrite(L"imap", L"enabled", L"1");
-    IniWrite(L"imap", L"email", email);
-    IniWrite(L"imap", L"host", host);
-    IniWrite(L"imap", L"port", std::to_wstring(port));
-    IniWrite(L"imap", L"secret", Utf8ToWide(blob));
-    IniWrite(L"imap", L"poll_seconds", L"10");
-    IniWrite(L"state", L"uidvalidity", std::to_wstring(uidValidity));
-    long long lastUid = uidNext > 0 ? uidNext - 1 : 0;
-    IniWrite(L"state", L"last_uid", std::to_wstring(lastUid));
-
-    LoadConfig();
-    AppPrint(L"设置成功！从现在的最新邮件开始监听。\r\n"
-             L"如果程序已在后台运行，请退出托盘图标后重新启动以生效。\r\n"
-             L"可用 --mail-check 立即检查最近几封邮件是否包含验证码。\r\n");
-    return true;
-}
-
-bool MailDisable() {
-    IniWrite(L"imap", L"enabled", L"0");
-    LoadConfig();
-    AppPrint(L"已关闭邮箱验证码监控。\r\n");
-    return true;
-}
-
-void MailCheckRecent(int count) {
-    LoadConfig();
-    if (g_cfg.email.empty() || g_cfg.host.empty() || g_cfg.secretB64.empty()) {
-        AppPrint(L"尚未配置邮箱，请先运行: PhoneLinkCode.exe --mail-setup\r\n");
-        return;
+    MailConfig c;
+    if (existing) {
+        c = *existing;
+        bool sameMailbox = _wcsicmp(existing->email.c_str(), email.c_str()) == 0 &&
+                           _wcsicmp(existing->host.c_str(), host.c_str()) == 0 && existing->port == port;
+        if (!sameMailbox) { c.uidValidity = uidValidity; c.lastUid = uidNext > 0 ? uidNext - 1 : 0; }
+    } else {
+        c.section = L"mail." + std::to_wstring(NextSectionNumber());
+        c.uidValidity = uidValidity;
+        c.lastUid = uidNext > 0 ? uidNext - 1 : 0;
+        c.pollSeconds = 10;
     }
+    c.enabled = true;
+    c.email = email;
+    c.host = host;
+    c.port = port;
+    c.secretB64 = Utf8ToWide(blob);
+    SaveAccount(c);
+
+    LoadConfig();
+    AppPrint(L"\r\n设置成功（" + (existing ? wstring(L"已更新") : wstring(L"已新增")) + L"）。当前邮箱：\r\n");
+    PrintAccountList();
+    AppPrint(L"\r\n如果程序已在后台运行，请退出托盘图标后重新启动以生效。\r\n"
+             L"可用 --mail-check 立即检查各邮箱最近几封邮件是否包含验证码。\r\n");
+    return true;
+}
+
+bool MailDisable(const wstring& email) {
+    LoadConfig();
+    if (email.empty()) {
+        for (auto& c : g_cfgs) {
+            c.enabled = false;
+            IniWrite(c.section, L"enabled", L"0");
+        }
+        AppPrint(g_cfgs.empty() ? L"尚未配置邮箱。\r\n" : L"已关闭全部邮箱监控。\r\n");
+        return true;
+    }
+    MailConfig* c = FindAccount(email);
+    if (!c) { AppPrint(L"未找到邮箱: " + email + L"\r\n"); return false; }
+    c->enabled = false;
+    IniWrite(c->section, L"enabled", L"0");
+    AppPrint(L"已关闭邮箱监控: " + email + L"\r\n");
+    return true;
+}
+
+bool MailRemove(const wstring& email) {
+    LoadConfig();
+    MailConfig* c = FindAccount(email);
+    if (!c) { AppPrint(L"未找到邮箱: " + email + L"\r\n"); return false; }
+    wstring section = c->section;
+    IniDeleteSection(section);
+    LoadConfig();
+    AppPrint(L"已删除邮箱配置: " + email + L"\r\n"
+             L"如果程序已在后台运行，请退出托盘图标后重新启动以生效。\r\n");
+    return true;
+}
+
+bool MailList() {
+    LoadConfig();
+    if (g_cfgs.empty()) {
+        AppPrint(L"尚未配置邮箱，请先运行: PhoneLinkCode.exe --mail-setup\r\n");
+        return true;
+    }
+    AppPrint(L"已配置 " + std::to_wstring(g_cfgs.size()) + L" 个邮箱（配置段 / 地址 / 服务器 / 状态）：\r\n");
+    for (const auto& c : g_cfgs) {
+        AppPrint(L"  [" + c.section + L"] " + c.email + L"  " + c.host + L":" +
+                 std::to_wstring(c.port) + (c.enabled ? L"  启用" : L"  已关闭") +
+                 L"  轮询 " + std::to_wstring(c.pollSeconds) + L"s" +
+                 L"  last_uid=" + std::to_wstring(c.lastUid) + L"\r\n");
+    }
+    return true;
+}
+
+static void CheckOneAccount(const MailConfig& c, int count) {
+    AppPrint(L"\r\n========== " + c.email + L" (" + c.host + L":" + std::to_wstring(c.port) + L") ==========\r\n");
     wstring secret;
-    if (!UnprotectSecret(WideToUtf8(g_cfg.secretB64), secret)) {
+    if (!UnprotectSecret(WideToUtf8(c.secretB64), secret)) {
         AppPrint(L"无法解密已保存的授权码，请重新运行 --mail-setup。\r\n");
         return;
     }
 
     ImapClient imap;
     wstring err;
-    if (!imap.Connect(g_cfg.host, g_cfg.port, err)) { AppPrint(L"连接失败: " + err + L"\r\n"); return; }
-    if (!imap.Login(g_cfg.email, secret, err)) { AppPrint(L"登录失败: " + err + L"\r\n"); return; }
+    if (!imap.Connect(c.host, c.port, err)) { AppPrint(L"连接失败: " + err + L"\r\n"); return; }
+    if (!imap.Login(c.email, secret, err)) { AppPrint(L"登录失败: " + err + L"\r\n"); return; }
     long long uv = 0, un = 0;
     if (!imap.Examine(uv, un, err)) { AppPrint(L"打开收件箱失败: " + err + L"\r\n"); return; }
 
@@ -1390,6 +1573,15 @@ void MailCheckRecent(int count) {
         AppPrint(L"  验证码: " + (code.empty() ? wstring(L"（未找到）") : code) + L"\r\n\r\n");
     }
     imap.Logout();
+}
+
+void MailCheckRecent(int count) {
+    LoadConfig();
+    if (g_cfgs.empty()) {
+        AppPrint(L"尚未配置邮箱，请先运行: PhoneLinkCode.exe --mail-setup\r\n");
+        return;
+    }
+    for (const auto& c : g_cfgs) CheckOneAccount(c, count);
 }
 
 bool MailPing(const wstring& hostPort) {
@@ -1447,11 +1639,19 @@ bool MailParseFile(const wstring& path) {
 // 后台线程
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 后台线程（每个启用邮箱一个线程）
+// ---------------------------------------------------------------------------
+
 static HANDLE g_stopEvent = nullptr;
-static HANDLE g_worker = nullptr;
+static vector<HANDLE> g_workers;
 static HWND g_notifyWnd = nullptr;
-static ULONGLONG g_lastConnectLog = 0;
-static ULONGLONG g_lastAuthLog = 0;
+
+struct WorkerCtx {
+    MailConfig cfg;
+    ULONGLONG lastConnectLog = 0;
+    ULONGLONG lastAuthLog = 0;
+};
 
 static bool StopRequested() {
     return g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0;
@@ -1470,68 +1670,74 @@ static void LogThrottled(ULONGLONG& last, const wstring& msg, int seconds) {
     }
 }
 
-static void NotifyCode(const wstring& code) {
+static wstring AccountTag(const MailConfig& c) {
+    return L"[" + c.email + L"] ";
+}
+
+static void NotifyCode(const MailConfig& c, const wstring& code) {
     if (g_notifyWnd) {
-        PostMessageW(g_notifyWnd, kMailNotifyMsg, 0, (LPARAM)new wstring(code));
+        MailNotification* n = new MailNotification{ code, c.email };
+        PostMessageW(g_notifyWnd, kMailNotifyMsg, 0, (LPARAM)n);
     }
 }
 
-static void HandleMailMessage(const string& raw) {
+static void HandleMailMessage(MailConfig& c, const string& raw) {
     ParsedMail mail;
     if (!ParseMail(raw, mail)) return;
 
     wstring text = mail.subject + L"\r\n" + mail.body;
     wstring code = AppExtractCode(text);
     if (code.empty()) {
-        AppLog(L"新邮件未找到验证码 | 主题: " + SafeOneLine(mail.subject, 80));
+        AppLog(AccountTag(c) + L"新邮件未找到验证码 | 主题: " + SafeOneLine(mail.subject, 80));
         return;
     }
     if (mail.hasDate) {
         int age = MailAgeMinutes(mail.dateFileTime);
         if (age > 10) {
-            AppLog(L"邮箱验证码已过期(" + std::to_wstring(age) + L"分钟)，跳过: " + code);
+            AppLog(AccountTag(c) + L"邮箱验证码已过期(" + std::to_wstring(age) + L"分钟)，跳过: " + code);
             return;
         }
     }
     if (AppCopyToClipboard(code)) {
-        AppLog(L"已复制邮箱验证码 " + code + L" | 主题: " + SafeOneLine(mail.subject, 80));
-        NotifyCode(code);
+        AppLog(AccountTag(c) + L"已复制邮箱验证码 " + code + L" | 主题: " + SafeOneLine(mail.subject, 80));
+        NotifyCode(c, code);
     } else {
-        AppLog(L"复制邮箱验证码失败: " + code);
+        AppLog(AccountTag(c) + L"复制邮箱验证码失败: " + code);
     }
 }
 
 // 返回 false 表示需要重连
-static bool MailSessionLoop(const wstring& secret) {
+static bool MailSessionLoop(WorkerCtx& ctx, const wstring& secret) {
+    MailConfig& c = ctx.cfg;
     ImapClient imap;
     wstring err;
-    if (!imap.Connect(g_cfg.host, g_cfg.port, err)) {
-        LogThrottled(g_lastConnectLog, L"IMAP 连接失败: " + err, 300);
+    if (!imap.Connect(c.host, c.port, err)) {
+        LogThrottled(ctx.lastConnectLog, AccountTag(c) + L"IMAP 连接失败: " + err, 300);
         return false;
     }
-    if (!imap.Login(g_cfg.email, secret, err)) {
-        LogThrottled(g_lastAuthLog, L"IMAP 登录失败: " + err, 300);
+    if (!imap.Login(c.email, secret, err)) {
+        LogThrottled(ctx.lastAuthLog, AccountTag(c) + L"IMAP 登录失败: " + err, 300);
         return false;
     }
-    AppLog(L"IMAP 已连接: " + g_cfg.email + L" @ " + g_cfg.host);
+    AppLog(AccountTag(c) + L"IMAP 已连接 @ " + c.host);
 
     long long uidValidity = 0, uidNext = 0;
     if (!imap.Examine(uidValidity, uidNext, err)) {
-        AppLog(L"打开收件箱失败: " + err);
+        AppLog(AccountTag(c) + L"打开收件箱失败: " + err);
         return false;
     }
 
-    if (g_cfg.uidValidity != uidValidity) {
-        if (g_cfg.uidValidity != 0) AppLog(L"邮箱 UIDVALIDITY 变化，重置监听位置");
-        g_cfg.uidValidity = uidValidity;
-        g_cfg.lastUid = uidNext > 0 ? uidNext - 1 : 0;
-        SaveState();
+    if (c.uidValidity != uidValidity) {
+        if (c.uidValidity != 0) AppLog(AccountTag(c) + L"邮箱 UIDVALIDITY 变化，重置监听位置");
+        c.uidValidity = uidValidity;
+        c.lastUid = uidNext > 0 ? uidNext - 1 : 0;
+        SaveState(c);
     }
 
     while (!StopRequested()) {
         vector<long long> uids;
-        if (!imap.SearchNew(g_cfg.lastUid, uids, err)) {
-            AppLog(L"搜索新邮件失败: " + err);
+        if (!imap.SearchNew(c.lastUid, uids, err)) {
+            AppLog(AccountTag(c) + L"搜索新邮件失败: " + err);
             return false;
         }
         if (uids.size() > 20) uids.erase(uids.begin(), uids.end() - 20);
@@ -1539,29 +1745,30 @@ static bool MailSessionLoop(const wstring& secret) {
             if (StopRequested()) return true;
             string raw;
             if (!imap.FetchRaw(uid, 1024 * 1024, raw, err)) {
-                AppLog(L"读取邮件失败(UID " + std::to_wstring(uid) + L"): " + err);
+                AppLog(AccountTag(c) + L"读取邮件失败(UID " + std::to_wstring(uid) + L"): " + err);
                 return false;
             }
-            g_cfg.lastUid = uid;
-            SaveState();
-            if (!raw.empty()) HandleMailMessage(raw);
+            c.lastUid = uid;
+            SaveState(c);
+            if (!raw.empty()) HandleMailMessage(c, raw);
         }
-        if (SleepStop(g_cfg.pollSeconds * 1000)) break;
+        if (SleepStop(c.pollSeconds * 1000)) break;
     }
     imap.Logout();
     return true;
 }
 
-static DWORD WINAPI MailThread(LPVOID) {
+static DWORD WINAPI MailThread(LPVOID param) {
+    std::unique_ptr<WorkerCtx> ctx(static_cast<WorkerCtx*>(param));
     wstring secret;
-    if (!UnprotectSecret(WideToUtf8(g_cfg.secretB64), secret)) {
-        AppLog(L"无法解密邮箱授权码，请在托盘菜单退出后重新运行 --mail-setup");
+    if (!UnprotectSecret(WideToUtf8(ctx->cfg.secretB64), secret)) {
+        AppLog(AccountTag(ctx->cfg) + L"无法解密邮箱授权码，请重新运行 --mail-setup");
         return 0;
     }
 
     int backoff = 5;
     while (!StopRequested()) {
-        if (MailSessionLoop(secret)) {
+        if (MailSessionLoop(*ctx, secret)) {
             backoff = 5;
         } else {
             if (SleepStop(backoff * 1000)) break;
@@ -1580,31 +1787,50 @@ void MailInit(const wstring& homeDir) {
     LoadConfig();
 }
 
+int MailEnabledCount() {
+    int n = 0;
+    for (const auto& c : g_cfgs)
+        if (c.enabled && ConfigComplete(c)) ++n;
+    return n;
+}
+
 bool MailIsEnabled() {
-    bool ok = g_cfg.enabled && !g_cfg.email.empty() && !g_cfg.host.empty() && !g_cfg.secretB64.empty();
-    if (g_cfg.enabled && !ok) {
-        AppLog(L"邮箱配置不完整，已跳过邮箱监控（可用 --mail-setup 重新配置）");
-    }
-    return ok;
+    bool incomplete = false;
+    for (const auto& c : g_cfgs)
+        if (c.enabled && !ConfigComplete(c)) incomplete = true;
+    if (incomplete)
+        AppLog(L"有邮箱配置不完整，已跳过对应账号（可用 --mail-setup 重新配置）");
+    return MailEnabledCount() > 0;
 }
 
 void MailStartWorker(HWND notifyWnd) {
-    if (g_worker) return;
+    if (!g_workers.empty()) return;
     if (!MailIsEnabled()) return;
     g_notifyWnd = notifyWnd;
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    g_worker = CreateThread(nullptr, 0, MailThread, nullptr, 0, nullptr);
-    AppLog(L"邮箱验证码监控已启动: " + g_cfg.email);
+    int started = 0;
+    for (const auto& c : g_cfgs) {
+        if (!c.enabled || !ConfigComplete(c)) continue;
+        WorkerCtx* ctx = new WorkerCtx{ c };
+        HANDLE h = CreateThread(nullptr, 0, MailThread, ctx, 0, nullptr);
+        if (!h) { delete ctx; continue; }
+        g_workers.push_back(h);
+        ++started;
+        AppLog(L"邮箱验证码监控已启动: " + c.email);
+    }
+    AppLog(L"邮箱验证码监控启动完成，共 " + std::to_wstring(started) + L" 个邮箱");
 }
 
 void MailStopWorker() {
-    HANDLE worker = g_worker;
-    if (!worker) return;
-    g_worker = nullptr;   // 超时则放弃等待，线程会在网络超时后自行退出
+    if (g_workers.empty()) return;
+    vector<HANDLE> workers;
+    workers.swap(g_workers);   // 超时则放弃等待，线程会在网络超时后自行退出
     if (g_stopEvent) SetEvent(g_stopEvent);
-    DWORD rc = WaitForSingleObject(worker, 5000);
+    DWORD rc = WAIT_FAILED;
+    if (workers.size() <= MAXIMUM_WAIT_OBJECTS)
+        rc = WaitForMultipleObjects((DWORD)workers.size(), workers.data(), TRUE, 5000);
     if (rc == WAIT_OBJECT_0) {
-        CloseHandle(worker);
+        for (HANDLE h : workers) CloseHandle(h);
         if (g_stopEvent) { CloseHandle(g_stopEvent); g_stopEvent = nullptr; }
     }
 }

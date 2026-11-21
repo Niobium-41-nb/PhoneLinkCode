@@ -8,6 +8,7 @@
 
 - **短信**：轮询 Windows 通知数据库 `wpndatabase.db`，只读取「手机连接」写入的短信通知，按「验证码/校验码/动态码/code…」等关键字邻近规则提取 4–8 位数字。
 - **邮箱**：IMAP over TLS 只读监控（`EXAMINE INBOX` + `BODY.PEEK[]`，**不会把邮件标记为已读**），支持 QQ / 163 / 126 / 企业微信邮箱 / 139 / 阿里 / Gmail 等。
+- **多邮箱并行**：可添加任意多个邮箱账号，每个账号独立线程、独立监听进度，一个账号故障不影响其他账号。
 - 支持 multipart、base64、quoted-printable、RFC 2047 编码主题、UTF-8/GBK/GB18030/Big5 等字符集，以及 HTML 邮件（验证码被 `<span>` 拆开也能合并识别）。
 - 只处理 **10 分钟内**的新消息，避免把历史验证码误贴进剪贴板。
 - 托盘图标、单实例、开机自启、日志查看。
@@ -74,7 +75,7 @@ PhoneLinkCode.exe --extract "【某网站】您的验证码是 847219，10 分�
 :: 输出: 847219
 ```
 
-### 3. 邮箱验证码配置
+### 3. 邮箱验证码配置（支持多个邮箱）
 
 程序不依赖网页邮箱页面，直接连邮箱的 IMAP 服务器，所以先在邮箱里**开启 IMAP 并拿到授权码/应用密码**：
 
@@ -92,28 +93,31 @@ PhoneLinkCode.exe --extract "【某网站】您的验证码是 847219，10 分�
 PhoneLinkCode.exe --mail-setup
 ```
 
-依次输入：
+先会列出已配置的邮箱，然后依次输入：
 
-1. **邮箱地址**（如 `someone@qq.com`）
+1. **邮箱地址**（如 `someone@qq.com`）：输入**新邮箱**即新增一个账号；输入**已有邮箱**则更新该账号（授权码留空可沿用原值）
 2. **IMAP 服务器**：自动按域名猜测（qq.com → `imap.qq.com`，163 → `imap.163.com`，gmail → `imap.gmail.com`，其他默认 `imap.<域名>`），直接回车采用
 3. **端口**：默认 `993`（SSL/TLS）
 4. **授权码/密码**：输入时不回显
 
-程序会实际连接、登录并打开收件箱验证一遍，通过后把配置写入 `mail.ini`，从**当前最新一封邮件之后**开始监听（不会把旧验证码贴出来）。
+程序会实际连接、登录并打开收件箱验证一遍，通过后写入 `mail.ini`。新账号从**当前最新一封邮件之后**开始监听（不会把旧验证码贴出来）。
+
+重复运行 `--mail-setup` 即可继续添加更多邮箱。每个账号在后台各有一个监控线程，日志和托盘气泡都会带上邮箱地址；某个账号连不上不会影响其他账号。
 
 > 修改配置后需要重启后台程序（托盘右键 → 退出，再打开）才会生效。
 
 验证与排错命令：
 
 ```bat
-PhoneLinkCode.exe --mail-check 5          :: 立即拉取最近 5 封邮件，显示发件人/主题/提取到的验证码
+PhoneLinkCode.exe --mail-list             :: 查看已配置的邮箱及监听进度
+PhoneLinkCode.exe --mail-check 5          :: 依次检查所有邮箱最近 5 封邮件
 PhoneLinkCode.exe --mail-ping             :: 测试 imap.qq.com:993 的 TLS 握手
 PhoneLinkCode.exe --mail-ping imap.163.com:993
 PhoneLinkCode.exe --mail-parse 示例.eml   :: 离线解析 .eml 文件，验证编码/HTML 提取
-PhoneLinkCode.exe --mail-disable          :: 关闭邮箱监控（保留已保存的配置）
+PhoneLinkCode.exe --mail-disable          :: 关闭全部邮箱监控
+PhoneLinkCode.exe --mail-disable someone@qq.com   :: 只关闭指定邮箱
+PhoneLinkCode.exe --mail-remove someone@qq.com    :: 删除指定邮箱配置
 ```
-
-再次运行 `--mail-setup` 可换邮箱或更新授权码。
 
 > Microsoft 个人账号（outlook.com / hotmail.com）已基本停用密码方式登录 IMAP，本程序暂不支持 OAuth，因此不建议用这类邮箱。
 
@@ -121,14 +125,16 @@ PhoneLinkCode.exe --mail-disable          :: 关闭邮箱监控（保留已保�
 
 | 参数 | 说明 |
 | --- | --- |
-| *(无参数)* | 后台托盘运行：每 2 秒查短信，按 `poll_seconds`（默认 10 秒）查邮箱 |
+| *(无参数)* | 后台托盘运行：每 2 秒查短信，按 `poll_seconds`（默认 10 秒）查各邮箱 |
 | `--list [N]` | 列出最近 N 条手机连接短信及提取结果，默认 10，最大 500 |
 | `--extract "文本"` | 测试验证码提取逻辑，只打印结果，不写剪贴板 |
-| `--mail-setup` | 交互式配置邮箱监控 |
-| `--mail-check [N]` | 立即检查最近 N 封邮件，默认 5，最大 50 |
+| `--mail-setup` | 交互式添加 / 更新邮箱（可配置多个） |
+| `--mail-list` | 列出已配置的邮箱、服务器、启停状态与监听进度 |
+| `--mail-check [N]` | 依次检查所有邮箱最近 N 封邮件，默认 5，最大 50 |
 | `--mail-ping [HOST[:PORT]]` | 测试 IMAP TLS 连接，默认 `imap.qq.com:993` |
 | `--mail-parse FILE` | 解析 `.eml` 文件并测试验证码提取 |
-| `--mail-disable` | 关闭邮箱监控 |
+| `--mail-disable [EMAIL]` | 关闭指定邮箱；省略 EMAIL 则关闭全部 |
+| `--mail-remove EMAIL` | 删除指定邮箱配置 |
 | `--install` / `--uninstall` | 添加 / 移除当前用户开机自启 |
 | `--help` / `-h` / `/?` | 显示帮助 |
 
@@ -140,7 +146,22 @@ PhoneLinkCode.exe --mail-disable          :: 关闭邮箱监控（保留已保�
 | --- | --- |
 | `app.log` | 运行日志（不含授权码） |
 | `state.txt` | 已处理到的短信通知 ID |
-| `mail.ini` | 邮箱配置；`[imap] secret` 是 DPAPI 加密的授权码，`[state]` 记录 UIDVALIDITY / 最后处理的 UID |
+| `mail.ini` | 邮箱配置：每个邮箱一个 `[mail.N]` 段，含地址、服务器、DPAPI 加密的授权码，以及该账号的 UIDVALIDITY / 最后处理的 UID |
+| `mail.ini.bak` | 旧版单邮箱格式迁移为多邮箱时自动备份的原文件 |
+
+`mail.ini` 中每个账号形如：
+
+```ini
+[mail.1]
+enabled=1
+email=someone@qq.com
+host=imap.qq.com
+port=993
+secret=<DPAPI 密文>
+poll_seconds=10
+uidvalidity=1795259864
+last_uid=1524
+```
 
 - DPAPI 密文与当前 Windows 用户绑定，拷到别的机器/账户无法解密；泄漏 `mail.ini` 也拿不到授权码明文。
 - 邮箱全程**只读**：只发 `EXAMINE`（非 `SELECT`）和 `BODY.PEEK[]`，不改已读状态、不删信、不发信。
@@ -163,4 +184,5 @@ PhoneLinkCode.exe --mail-disable          :: 关闭邮箱监控（保留已保�
 - **邮箱登录失败**：绝大多数情况是用了登录密码而不是授权码，或没在邮箱设置里开启 IMAP。用 `--mail-ping` 先确认网络/TLS 可达。
 - **163 邮箱超时**：程序已优先使用 IPv4（部分邮箱的 IPv6 入口能握手但不返回 IMAP 问候）；仍失败时检查本机 IPv6 代理/防火墙。
 - **修改 `mail.ini` 或重新 `--mail-setup` 后不生效**：退出托盘程序再启动。
-- **想清空历史状态**：关闭程序后删除 `%LOCALAPPDATA%\PhoneLinkCode\state.txt`（短信进度）或 `mail.ini` 中的 `[state]` 段即可。
+- **某个邮箱停止检查**：看 `app.log` 中该邮箱的日志；`--mail-check` 会逐个账号显示连接/登录错误。某个账号失败不会影响其他账号。
+- **想清空历史状态**：关闭程序后删除 `%LOCALAPPDATA%\PhoneLinkCode\state.txt`（短信进度），或删除 `mail.ini` 中对应 `[mail.N]` 段的 `uidvalidity`/`last_uid` 两行（该邮箱从最新邮件重新开始）。

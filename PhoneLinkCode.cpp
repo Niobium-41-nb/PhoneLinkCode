@@ -830,7 +830,7 @@ static void ShowTrayMenu() {
     AppendMenuW(menu, MF_STRING, 2, L"打开日志");
     AppendMenuW(menu, MF_STRING | (IsAutostartEnabled() ? MF_CHECKED : 0), 3, L"开机自动启动");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, 5, MailIsEnabled() ? L"重新设置邮箱验证码..." : L"设置邮箱验证码监控...");
+    AppendMenuW(menu, MF_STRING, 5, MailIsEnabled() ? L"管理邮箱验证码..." : L"设置邮箱验证码监控...");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 4, L"退出");
 
@@ -878,10 +878,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
     case kMailNotifyMsg: {
-        std::wstring* code = reinterpret_cast<std::wstring*>(lParam);
-        if (code) {
-            Balloon(kAppTitle, L"邮箱验证码已复制：" + *code);
-            delete code;
+        MailNotification* n = reinterpret_cast<MailNotification*>(lParam);
+        if (n) {
+            Balloon(kAppTitle, L"邮箱验证码已复制：" + n->code + L"\n" + n->account);
+            delete n;
         }
         return 0;
     }
@@ -945,9 +945,10 @@ static int RunDaemon() {
     SetTimer(g_hwnd, kTimerId, kPollIntervalMs, nullptr);
     PollNewNotifications(true);
     MailStartWorker(g_hwnd);
-    if (MailIsEnabled())
-        Balloon(kAppTitle, L"已启动：短信和邮箱验证码都会自动复制到剪贴板");
-    else
+    if (MailIsEnabled()) {
+        int n = MailEnabledCount();
+        Balloon(kAppTitle, L"已启动：短信和 " + std::to_wstring(n) + L" 个邮箱的验证码都会自动复制到剪贴板");
+    } else
         Balloon(kAppTitle, L"已启动，收到短信验证码后将自动复制到剪贴板");
 
     MSG msg;
@@ -976,12 +977,14 @@ static void ShowUsage() {
         L"  PhoneLinkCode.exe --extract TEXT 测试验证码提取逻辑，不修改剪贴板\r\n"
         L"  PhoneLinkCode.exe --install      加入当前用户的开机启动项\r\n"
         L"  PhoneLinkCode.exe --uninstall    移除开机启动项\r\n\r\n"
-        L"邮箱（浏览器网页邮箱也可用，需要邮箱开启 IMAP）:\r\n"
-        L"  PhoneLinkCode.exe --mail-setup   交互式配置邮箱（授权码用 DPAPI 加密保存在本机）\r\n"
-        L"  PhoneLinkCode.exe --mail-check [N]  立即检查最近 N 封邮件（默认 5）\r\n"
+        L"邮箱（可配置多个账号，浏览器网页邮箱也可用，需开启 IMAP）:\r\n"
+        L"  PhoneLinkCode.exe --mail-setup   交互式添加/更新邮箱（授权码用 DPAPI 加密保存在本机）\r\n"
+        L"  PhoneLinkCode.exe --mail-list    列出已配置的邮箱\r\n"
+        L"  PhoneLinkCode.exe --mail-check [N]  立即检查所有邮箱最近 N 封邮件（默认 5）\r\n"
         L"  PhoneLinkCode.exe --mail-parse FILE 解析 .eml 文件并测试验证码提取\r\n"
         L"  PhoneLinkCode.exe --mail-ping HOST[:PORT] 测试 IMAP TLS 连接（默认 imap.qq.com:993）\r\n"
-        L"  PhoneLinkCode.exe --mail-disable 关闭邮箱监控\r\n"
+        L"  PhoneLinkCode.exe --mail-disable [EMAIL] 关闭邮箱监控（省略 EMAIL 则全部关闭）\r\n"
+        L"  PhoneLinkCode.exe --mail-remove EMAIL    删除指定邮箱配置\r\n"
         L"  提示: QQ/163 需在邮箱设置中开启 IMAP 并使用“授权码”；Gmail 需使用应用专用密码;\r\n"
         L"        Microsoft 账号(outlook/hotmail)已基本停用密码登录，暂不支持 OAuth。\r\n\r\n"
         L"状态与日志目录: %LOCALAPPDATA%\\PhoneLinkCode\\\r\n"
@@ -1064,7 +1067,20 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         }
         if (argIs(L"--mail-disable")) {
             EnsureConsole();
-            MailDisable();
+            MailDisable(argc >= 3 ? argv[2] : L"");
+            LocalFree(argv);
+            return 0;
+        }
+        if (argIs(L"--mail-remove")) {
+            EnsureConsole();
+            if (argc >= 3) MailRemove(argv[2]);
+            else Print(L"用法: PhoneLinkCode.exe --mail-remove someone@example.com\r\n");
+            LocalFree(argv);
+            return 0;
+        }
+        if (argIs(L"--mail-list")) {
+            EnsureConsole();
+            MailList();
             LocalFree(argv);
             return 0;
         }
